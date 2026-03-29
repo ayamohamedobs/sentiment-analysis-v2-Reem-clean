@@ -7,10 +7,13 @@ Run:
 
 from __future__ import annotations
 
-import json
+import hashlib
 import io
+import json
 import os
-import re
+import sys
+import time
+from typing import Any
 
 # .env values OVERRIDE existing env vars to avoid stale terminal sessions
 _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
@@ -22,25 +25,22 @@ if os.path.exists(_env_path):
                 _k, _v = _line.split("=", 1)
                 os.environ[_k.strip()] = _v.strip().strip('"')
 
-import sys
-import time
-
 import streamlit as st
-from azure.identity import DefaultAzureCredential
-from azure.ai.projects import AIProjectClient
 from azure.ai.agents.models import ToolOutput
+from azure.ai.projects import AIProjectClient
+from azure.identity import DefaultAzureCredential
 
 # Ensure src/ is on path so language_tools is importable
 sys.path.insert(0, os.path.dirname(__file__))
 
 # ─── Application Insights Configuration ──────────────────────────────────────
 
-# Initialize Application Insights if connection string is available
 _appinsights_connection_string = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING")
 if _appinsights_connection_string:
     try:
-        from azure.monitor.opentelemetry import configure_azure_monitor
         from azure.ai.agents.telemetry import AIAgentsInstrumentor
+        from azure.monitor.opentelemetry import configure_azure_monitor
+
         configure_azure_monitor(connection_string=_appinsights_connection_string)
         AIAgentsInstrumentor().instrument()
         print("✅ Application Insights monitoring enabled (with agents tracing)")
@@ -50,11 +50,11 @@ else:
     print("ℹ️  Application Insights not configured (APPLICATIONINSIGHTS_CONNECTION_STRING not set)")
 
 
-# ─── Excel reader ──────────────────────────────────────────────────────
+# ─── File reader ─────────────────────────────────────────────────────────────
 
-_RESPONSE_COLS = ["response", "comment", "feedback", "text", "answer", "remarks", "survey"]
-# Patterns that indicate an ID/code column — skip during auto-detection
-_SKIP_COL_PATTERNS = ["id", "code", "ref", "key", "num", "date", "time", "score", "rating"]
+_REQUIRED_FIELD_KEYS = ["survey_response_id", "question_name", "response_value"]
+_OPTIONAL_FIELD_KEYS = ["fields_name"]
+_NULL_LIKE_VALUES = {"", "na", "n/a", "none", "null", "nan"}
 
 
 def _load_dataframe(file_bytes: bytes) -> "pd.DataFrame":
@@ -80,9 +80,10 @@ def _load_dataframe(file_bytes: bytes) -> "pd.DataFrame":
         errors.append(f"html: {exc}")
 
     drm_hint = ""
-    if file_bytes[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+    if file_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
         try:
             import olefile
+
             ole = olefile.OleFileIO(io.BytesIO(file_bytes))
             streams = [s for entry in ole.listdir() for s in entry]
             if "EncryptedPackage" in streams or "DRMEncryptedDataSpace" in streams:
@@ -90,7 +91,7 @@ def _load_dataframe(file_bytes: bytes) -> "pd.DataFrame":
                     "\n\n**This file is protected by Microsoft Information Protection (DRM).**\n"
                     "To use it:\n"
                     "1. Open it in Excel\n"
-                    "2. Go to **File \u2192 Save As** and save as a new `.xlsx` or CSV file\n"
+                    "2. Go to **File → Save As** and save as a new `.xlsx` or CSV file\n"
                     "3. Upload the new unprotected file"
                 )
         except Exception:
@@ -98,30 +99,94 @@ def _load_dataframe(file_bytes: bytes) -> "pd.DataFrame":
     raise ValueError("Could not open file." + drm_hint)
 
 
-def _guess_text_column(df: "pd.DataFrame") -> str:
-    """Pick the most likely free-text response column."""
-    # 1. Column name matches a known keyword and NOT a skip pattern
-    for candidate in _RESPONSE_COLS:
-        for c in df.columns:
-            col_lower = str(c).lower()
-            if candidate in col_lower and not any(p in col_lower for p in _SKIP_COL_PATTERNS):
-                return c
-    # 2. Fall back: string column with longest average text length
-    str_cols = df.select_dtypes(include="object").columns.tolist()
-    if str_cols:
-        return max(str_cols, key=lambda c: df[c].dropna().astype(str).str.len().mean())
-    return str(df.columns[0])
+def _normalize_col_name(value: Any) -> str:
+    return " ".join(str(value).strip().lower().replace("_", " ").split())
 
 
-def read_excel_responses(file_bytes: bytes, filename: str, col: str | None = None):
-    """Load file and return (df, selected_col, all_columns)."""
-    df = _load_dataframe(file_bytes)
-    all_cols = [str(c) for c in df.columns]
-    if col is None or col not in all_cols:
-        col = _guess_text_column(df)
-    # Normalise column name to string
-    df.columns = all_cols
-    return df, col, all_cols
+def _suggest_mapping(columns: list[str], field_key: str) -> str | None:
+    field_aliases = {
+        "survey_response_id": [
+            "survey response id",
+            "response id",
+            "survey id",
+            "submission id",
+            "case id",
+            "id",
+        ],
+        "question_name": [
+            "question name",
+            "question",
+            "question text",
+            "question label",
+            "item",
+        ],
+        "response_value": [
+            "response value",
+            "response",
+            "answer",
+            "comment",
+            "feedback",
+            "value",
+            "text",
+        ],
+        "fields_name": ["fields name", "field name", "field", "metadata", "attribute"],
+    }
+
+    normalized = {_normalize_col_name(c): c for c in columns}
+    for alias in field_aliases.get(field_key, []):
+        alias_norm = _normalize_col_name(alias)
+        if alias_norm in normalized:
+            return normalized[alias_norm]
+
+    for col in columns:
+        ncol = _normalize_col_name(col)
+        if any(alias in ncol for alias in field_aliases.get(field_key, [])):
+            return col
+    return None
+
+
+def _is_blank_or_null_like(value: Any) -> bool:
+    try:
+        import pandas as pd
+
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+
+    s = str(value).strip()
+    if not s:
+        return True
+    return s.lower() in _NULL_LIKE_VALUES
+
+
+def _to_text(value: Any) -> str:
+    if _is_blank_or_null_like(value):
+        return ""
+    return str(value).strip()
+
+
+def _build_structured_rows(df: "pd.DataFrame", mapping: dict[str, str]) -> list[dict[str, str]]:
+    """Build structured row records, skipping only blank/null response values."""
+    rows: list[dict[str, str]] = []
+    for _, row in df.iterrows():
+        response_raw = row.get(mapping["response_value"])
+        if _is_blank_or_null_like(response_raw):
+            continue
+
+        record = {
+            "survey_response_id": _to_text(row.get(mapping["survey_response_id"])),
+            "question_name": _to_text(row.get(mapping["question_name"])),
+            "response_value": _to_text(response_raw),
+        }
+
+        optional_col = mapping.get("fields_name")
+        if optional_col:
+            record["fields_name"] = _to_text(row.get(optional_col))
+
+        rows.append(record)
+
+    return rows
 
 
 # ─── Page configuration ───────────────────────────────────────────────────────
@@ -132,7 +197,8 @@ st.set_page_config(
     layout="wide",
 )
 
-# ─── Load agent config ────────────────────────────────────────────────────────
+
+# ─── Load agent config / prompts ─────────────────────────────────────────────
 
 @st.cache_resource
 def load_config() -> dict:
@@ -144,6 +210,13 @@ def load_config() -> dict:
 @st.cache_resource
 def get_client(endpoint: str) -> AIProjectClient:
     return AIProjectClient(endpoint=endpoint, credential=DefaultAzureCredential())
+
+
+@st.cache_data
+def load_prompt_text() -> str:
+    prompt_path = os.path.join(os.path.dirname(__file__), "..", "prompt.txt")
+    with open(prompt_path, encoding="utf-8") as f:
+        return f.read().strip()
 
 
 # ─── Session state ────────────────────────────────────────────────────────────
@@ -175,78 +248,151 @@ def _count_docs_from_args(fn_args: dict) -> int:
     return len(docs) if isinstance(docs, list) else 0
 
 
+def _count_rows_from_args(fn_args: dict) -> int:
+    """Count structured rows from tool arguments when explicitly provided."""
+    rows = fn_args.get("rows", [])
+    if isinstance(rows, str):
+        try:
+            rows = json.loads(rows)
+        except (json.JSONDecodeError, TypeError):
+            return 1
+    return len(rows) if isinstance(rows, list) else 0
+
+
 def _extract_processed_count(fn_name: str, fn_args: dict, result: str) -> int:
-    """Estimate rows processed by analyze_sentiment tool calls."""
-    if fn_name != "analyze_sentiment":
+    """Estimate rows/documents processed by analysis tool calls."""
+    if fn_name == "analyze_sentiment":
+        explicit = _count_docs_from_args(fn_args)
+        if explicit:
+            return explicit
+
+        try:
+            payload = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return 0
+
+        if isinstance(payload, dict):
+            total = payload.get("total_documents")
+            return int(total) if isinstance(total, int) else 0
+        if isinstance(payload, list):
+            return len(payload)
         return 0
 
-    explicit = _count_docs_from_args(fn_args)
-    if explicit:
-        return explicit
+    if fn_name == "analyze_structured_survey":
+        explicit = _count_rows_from_args(fn_args)
+        if explicit:
+            return explicit
 
-    try:
-        payload = json.loads(result)
-    except (json.JSONDecodeError, TypeError):
+        try:
+            payload = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return 0
+
+        if isinstance(payload, dict):
+            coverage = payload.get("coverage", {})
+            if isinstance(coverage, dict):
+                processed = coverage.get("processed_rows")
+                if isinstance(processed, int):
+                    return processed
+            enriched_rows = payload.get("enriched_rows")
+            if isinstance(enriched_rows, list):
+                return len(enriched_rows)
         return 0
 
-    if isinstance(payload, dict):
-        total = payload.get("total_documents")
-        return int(total) if isinstance(total, int) else 0
-    if isinstance(payload, list):
-        return len(payload)
     return 0
 
 
-def _extract_section2_rows(fn_name: str, result: str) -> list[dict]:
-    """Extract deterministic Section 2 rows from analyze_sentiment summary payload."""
-    if fn_name != "analyze_sentiment":
-        return []
+def _compute_rows_checksum(rows: list[dict[str, Any]]) -> str:
+    h = hashlib.sha256()
+    for row in rows:
+        part = "|".join(
+            [
+                str(row.get("survey_response_id", "")),
+                str(row.get("question_name", "")),
+                str(row.get("response_value", "")),
+            ]
+        )
+        h.update(part.encode("utf-8", errors="ignore"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _build_hard_proof(payload: dict[str, Any]) -> dict[str, Any]:
+    coverage = payload.get("coverage", {}) if isinstance(payload.get("coverage"), dict) else {}
+    enriched_rows = payload.get("enriched_rows", []) if isinstance(payload.get("enriched_rows"), list) else []
+
+    total_rows = int(coverage.get("total_rows", len(enriched_rows)) or 0)
+    eligible_rows = int(coverage.get("eligible_rows", len(enriched_rows)) or 0)
+    processed_rows = int(coverage.get("processed_rows", len(enriched_rows)) or 0)
+    failed_rows = int(coverage.get("failed_rows", 0) or 0)
+
+    return {
+        "rows_total_input": total_rows,
+        "rows_eligible_for_analysis": eligible_rows,
+        "rows_processed": processed_rows,
+        "rows_failed": failed_rows,
+        "rows_kept_in_full_payload": len(enriched_rows),
+        "rows_lost_check": max(processed_rows - len(enriched_rows), 0),
+        "full_rows_sha256": _compute_rows_checksum(enriched_rows),
+    }
+
+
+def _prepare_tool_output_for_submit(fn_name: str, result: str) -> str:
+    """
+    Keep full row-level payload locally, but submit a TPM-safe aggregate payload to the agent.
+    This does NOT truncate analysis itself; it only reduces transport volume.
+    """
+    if fn_name != "analyze_structured_survey":
+        return result
+
     try:
         payload = json.loads(result)
     except (json.JSONDecodeError, TypeError):
-        return []
-    if isinstance(payload, dict):
-        rows = payload.get("section_2_table_rows", [])
-        return rows if isinstance(rows, list) else []
-    return []
+        return result
+
+    if not isinstance(payload, dict):
+        return result
+
+    if payload.get("error"):
+        return result
+
+    st.session_state["_last_structured_survey_full_payload"] = payload
+
+    proof = _build_hard_proof(payload)
+    transport_payload = {
+        "coverage": payload.get("coverage", {}),
+        "survey_level_sentiment": payload.get("survey_level_sentiment", {}),
+        "response_level_sentiment": payload.get("response_level_sentiment", {}),
+        "main_cluster_breakdown": payload.get("main_cluster_breakdown", []),
+        "hard_proof": proof,
+        "notes": {
+            "analysis_mode": "full_row_analysis_no_truncation",
+            "transport_mode": "aggregate_only_for_tpm_safety",
+            "full_rows_available_locally": True,
+        },
+    }
+    return json.dumps(transport_payload, ensure_ascii=False)
 
 
-def _render_section2_markdown(rows: list[dict]) -> str:
-    """Render Section 2 in a fixed format independent of agent markdown."""
-    lines = [
-        "2. Where Sentiment Breaks Down",
-        "",
-        "| Theme | 🟢 Positive | 🟡 Neutral | 🔴 Negative |",
-        "| --- | --- | --- | --- |",
-    ]
-    for row in rows:
-        theme = str(row.get("theme", "")).strip() or "Unknown"
-        pos = str(row.get("positive_display") or f"{row.get('positive_count', 0)} ({float(row.get('positive_pct', 0)):.1f}%)")
-        neu = str(row.get("neutral_display") or f"{row.get('neutral_count', 0)} ({float(row.get('neutral_pct', 0)):.1f}%)")
-        neg = str(row.get("negative_display") or f"{row.get('negative_count', 0)} ({float(row.get('negative_pct', 0)):.1f}%)")
-        lines.append(f"| {theme} | {pos} | {neu} | {neg} |")
-    return "\n".join(lines)
-
-
-def _inject_section2(reply: str, rows: list[dict]) -> str:
-    """Replace agent-generated Section 2 with deterministic app-rendered table."""
-    if not rows:
+def _append_hard_proof_block(reply: str) -> str:
+    payload = st.session_state.get("_last_structured_survey_full_payload")
+    if not isinstance(payload, dict):
         return reply
 
-    section2 = _render_section2_markdown(rows)
-    pattern = re.compile(
-        r"(?ims)^\s*\**\s*2\.\s*Where Sentiment Breaks Down.*?(?=^\s*\**\s*3\.\s*Key Drivers of Negative Sentiment\b|\Z)"
+    proof = _build_hard_proof(payload)
+    proof_md = (
+        "\n\n---\n"
+        "### Hard Proof Block\n"
+        f"- Rows total input: **{proof['rows_total_input']}**\n"
+        f"- Rows eligible for analysis: **{proof['rows_eligible_for_analysis']}**\n"
+        f"- Rows processed: **{proof['rows_processed']}**\n"
+        f"- Rows failed: **{proof['rows_failed']}**\n"
+        f"- Rows kept in full payload: **{proof['rows_kept_in_full_payload']}**\n"
+        f"- Rows lost check: **{proof['rows_lost_check']}**\n"
+        f"- Full rows SHA-256: `{proof['full_rows_sha256']}`\n"
     )
+    return reply + proof_md
 
-    if pattern.search(reply):
-        return pattern.sub(section2 + "\n\n", reply, count=1)
-
-    section3_pattern = re.compile(r"(?ims)^\s*\**\s*3\.\s*Key Drivers of Negative Sentiment\b")
-    m = section3_pattern.search(reply)
-    if m:
-        return reply[:m.start()] + section2 + "\n\n" + reply[m.start():]
-
-    return reply.rstrip() + "\n\n" + section2
 
 def _build_tool_outputs(run, client: AIProjectClient, thread_id: str, status_widget=None):
     """Execute Language SDK function tools and submit outputs."""
@@ -273,10 +419,6 @@ def _build_tool_outputs(run, client: AIProjectClient, thread_id: str, status_wid
             result = json.dumps({"error": str(exc)})
 
         processed = _extract_processed_count(fn_name, fn_args, result)
-        section2_rows = _extract_section2_rows(fn_name, result)
-        if section2_rows:
-            st.session_state["_section2_rows"] = section2_rows
-
         if processed:
             st.session_state.setdefault("_rows_processed", 0)
             st.session_state["_rows_processed"] += processed
@@ -289,11 +431,14 @@ def _build_tool_outputs(run, client: AIProjectClient, thread_id: str, status_wid
                     state="running",
                 )
 
-        print(f"  ⚙️ {fn_name} took {time.time()-t0:.1f}s")
-        tool_outputs.append(ToolOutput(tool_call_id=call.id, output=result))
+        output_for_submit = _prepare_tool_output_for_submit(fn_name, result)
+        print(f"  ⚙️ {fn_name} took {time.time() - t0:.1f}s")
+        tool_outputs.append(ToolOutput(tool_call_id=call.id, output=output_for_submit))
 
     return client.agents.runs.submit_tool_outputs(
-        thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs,
+        thread_id=thread_id,
+        run_id=run.id,
+        tool_outputs=tool_outputs,
     )
 
 
@@ -302,13 +447,12 @@ def _wait_for_run(client: AIProjectClient, thread_id: str, run, status_widget=No
     terminal = {"completed", "failed", "cancelled", "expired"}
     deadline = time.time() + 300
     t_start = time.time()
-    t_phase = t_start  # reset per phase
+    t_phase = t_start
 
-    # Task-specific labels for the initial server-side processing phase
     phase1_labels = {
-        "fabric": "Foundry Agent \u2192 Fabric Agent: querying data",
-        "file":   "Foundry Agent: processing file",
-        "chat":   "Foundry Agent: thinking",
+        "fabric": "Foundry Agent → Fabric Agent: querying data",
+        "file": "Foundry Agent: processing file",
+        "chat": "Foundry Agent: thinking",
     }
     current_label = phase1_labels.get(task, phase1_labels["chat"])
     tools_ran = False
@@ -323,13 +467,14 @@ def _wait_for_run(client: AIProjectClient, thread_id: str, run, status_widget=No
             run._data["last_error"] = {"code": "timeout", "message": "Run exceeded 5-minute timeout."}
             rows_processed = int(st.session_state.pop("_rows_processed", 0))
             return run, rows_processed
+
         elapsed = int(time.time() - t_phase)
         if status_widget:
             status_widget.update(label=f"{current_label}... ({elapsed}s)", state="running")
         time.sleep(0.5)
         run = client.agents.runs.get(thread_id=thread_id, run_id=run.id)
         if run.status == "requires_action":
-            print(f"\u23f1\ufe0f requires_action at {time.time()-t_start:.1f}s")
+            print(f"⏱️ requires_action at {time.time() - t_start:.1f}s")
             t_phase = time.time()
             tools_ran = True
             run = _build_tool_outputs(run, client, thread_id, status_widget=status_widget)
@@ -338,9 +483,10 @@ def _wait_for_run(client: AIProjectClient, thread_id: str, run, status_widget=No
         elif tools_ran and current_label != "Foundry Agent: generating response":
             current_label = "Foundry Agent: generating response"
             t_phase = time.time()
+
     total = int(time.time() - t_start)
     rows_processed = int(st.session_state.pop("_rows_processed", 0))
-    print(f"\u23f1\ufe0f Run completed in {total}s (status: {run.status}, rows: {rows_processed})")
+    print(f"⏱️ Run completed in {total}s (status: {run.status}, rows: {rows_processed})")
     if status_widget:
         done_label = f"Done ({total}s total)"
         if rows_processed:
@@ -377,8 +523,9 @@ def send_message(
     status_widget=None,
     task: str = "chat",
 ) -> str:
-    # Clear any previous run leftovers.
-    st.session_state.pop("_section2_rows", None)
+    if task == "file":
+        st.session_state.pop("_last_structured_survey_full_payload", None)
+
     _cancel_active_runs(client, thread_id)
     client.agents.messages.create(thread_id=thread_id, role="user", content=content)
 
@@ -390,14 +537,14 @@ def send_message(
     if run.status == "failed":
         return f"❌ Run failed: {run.last_error}"
 
-    last = client.agents.messages.get_last_message_text_by_role(
-        thread_id=thread_id, role="assistant",
-    )
+    last = client.agents.messages.get_last_message_text_by_role(thread_id=thread_id, role="assistant")
     reply = last.text.value if last else "(no response)"
-    section2_rows = st.session_state.pop("_section2_rows", [])
-    reply = _inject_section2(reply, section2_rows)
     if rows_processed:
         reply += f"\n\n---\n*Language service processed: {rows_processed} rows*"
+
+    if task == "file":
+        reply = _append_hard_proof_block(reply)
+
     return reply
 
 
@@ -408,7 +555,6 @@ def main() -> None:
     client = get_client(config["endpoint"])
     init_session(client)
 
-    # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
         st.title("📊 Survey Analysis")
         st.caption(f"Agent: `{config['agent_name']}`")
@@ -416,23 +562,20 @@ def main() -> None:
         st.caption(f"Tools: `{config.get('tool_mode', 'sdk').upper()}`")
         st.divider()
 
-        # Data source selector — Fabric is available when the agent has the Fabric tool
         fabric_enabled = bool(os.environ.get("FABRIC_CONNECTION_NAME"))
         if fabric_enabled:
             data_source = st.radio(
                 "Data Source",
                 ["Local File", "Fabric Semantic Model"],
-                help="Choose between uploading a local file or querying Fabric data"
+                help="Choose between uploading a local file or querying Fabric data",
             )
         else:
             data_source = "Local File"
-            
+
         st.subheader("📁 " + data_source)
 
-        # Initialize variables
         fabric_query = None
-        
-        # Local file upload mode
+
         if data_source == "Local File":
             uploaded_file = st.file_uploader(
                 "Excel / CSV file",
@@ -440,87 +583,94 @@ def main() -> None:
                 help="Upload a survey file to analyse",
             )
         else:
-            # Fabric query mode
             uploaded_file = None
             fabric_query = st.text_area(
                 "Natural Language Query",
                 placeholder="e.g., Get all survey responses from last quarter",
                 help="Describe what data you want to analyze from your Fabric semantic model",
-                height=100
+                height=100,
             )
 
-        sel_cols = None
         file_bytes = None
         if uploaded_file:
             file_bytes = uploaded_file.read()
             try:
-                df_preview, guessed_col, all_cols = read_excel_responses(file_bytes, uploaded_file.name)
+                df_preview = _load_dataframe(file_bytes)
             except Exception as exc:
                 st.error(str(exc))
                 st.stop()
 
-            sel_cols = st.multiselect(
-                "Response columns (select 1-2)",
-                options=all_cols,
-                default=[guessed_col],
-                max_selections=2,
-                help="Select one or two columns to analyze",
+            all_cols = [str(c) for c in df_preview.columns]
+            df_preview.columns = all_cols
+
+            st.markdown("**Map source columns to required survey fields**")
+            mapping: dict[str, str | None] = {}
+            for field_key in _REQUIRED_FIELD_KEYS:
+                suggestion = _suggest_mapping(all_cols, field_key)
+                options = ["— Select column —", *all_cols]
+                default_idx = options.index(suggestion) if suggestion in options else 0
+                selected = st.selectbox(
+                    f"{field_key} *",
+                    options=options,
+                    index=default_idx,
+                    key=f"map_{field_key}",
+                )
+                mapping[field_key] = None if selected == options[0] else selected
+
+            optional_key = _OPTIONAL_FIELD_KEYS[0]
+            optional_suggestion = _suggest_mapping(all_cols, optional_key)
+            optional_options = ["— Not provided —", *all_cols]
+            optional_idx = optional_options.index(optional_suggestion) if optional_suggestion in optional_options else 0
+            optional_selected = st.selectbox(
+                f"{optional_key} (optional)",
+                options=optional_options,
+                index=optional_idx,
+                key=f"map_{optional_key}",
             )
-            # Show a quick preview of the selected columns
-            if sel_cols:
-                for col in sel_cols:
-                    preview_vals = df_preview[col].dropna().astype(str).head(2).tolist()
-                    st.caption(f"**{col}**: " + " / ".join(f'"{v[:50]}"' for v in preview_vals))
+            mapping[optional_key] = None if optional_selected == optional_options[0] else optional_selected
 
-        if file_bytes and sel_cols and st.button("Analyse File", type="primary", use_container_width=True):
-            try:
-                df_final, _, _ = read_excel_responses(file_bytes, uploaded_file.name)
-            except Exception as exc:
-                st.error(f"Could not read file: {exc}")
-                st.stop()
+            if all(mapping.get(k) for k in _REQUIRED_FIELD_KEYS):
+                preview_cols = [mapping[k] for k in _REQUIRED_FIELD_KEYS if mapping[k]]
+                if mapping.get(optional_key):
+                    preview_cols.append(mapping[optional_key])
+                st.caption("Preview of mapped columns")
+                st.dataframe(df_preview[preview_cols].head(5), use_container_width=True)
 
-            # Collect responses from all selected columns
-            all_responses = []
-            for col in sel_cols:
-                col_responses = df_final[col].dropna().astype(str).tolist()
-                all_responses.extend([(col, resp) for resp in col_responses])
+            if st.button("Analyse File", type="primary", use_container_width=True):
+                missing_required = [k for k in _REQUIRED_FIELD_KEYS if not mapping.get(k)]
+                if missing_required:
+                    st.error(f"Missing required mappings: {', '.join(missing_required)}")
+                    st.stop()
 
-            if not all_responses:
-                st.warning("No responses found in the selected columns.")
-                st.stop()
+                required_mapped_values = [mapping[k] for k in _REQUIRED_FIELD_KEYS]
+                if len(set(required_mapped_values)) != len(required_mapped_values):
+                    st.error("Each required field must map to a different source column.")
+                    st.stop()
 
-            # Store all uploaded responses for deterministic full-dataset processing.
-            from language_tools import set_pending_documents
-            docs_for_tool = [resp for _, resp in all_responses]
-            set_pending_documents(docs_for_tool)
+                structured_rows = _build_structured_rows(df_preview, mapping)  # type: ignore[arg-type]
+                if not structured_rows:
+                    st.warning("No eligible rows found. Only rows with non-empty response_value are processed.")
+                    st.stop()
 
-            if len(sel_cols) == 1:
-                col_desc = f"column `{sel_cols[0]}`"
-            else:
-                col_desc = f"columns `{', '.join(sel_cols)}`"
+                from language_tools import set_pending_structured_rows
 
-            header = (
-                f"File: **{uploaded_file.name}** — {len(docs_for_tool)} responses "
-                f"from {col_desc}"
-            )
-            user_msg = (
-                f"{header}\n\n"
-                "Analyze the uploaded survey file now.\n"
-                "Call analyze_sentiment with NO arguments so it uses the full uploaded dataset.\n"
-                "Do NOT use extract_key_phrases or recognize_entities unless explicitly requested.\n\n"
-                "Provide analysis in this structure:\n"
-                "1. Customer Sentiment Overview (executive summary)\n"
-                "2. Where Sentiment Breaks Down (table with themes and sentiment percentages)\n"
-                "3. Key Drivers of Negative Sentiment (table with top 5 issue clusters)\n"
-                "4. Key Drivers of Positive Sentiment (table with top strengths)\n"
-                "5. Insight-Driven Recommendations (numbered, with Why/Recommendation format)"
-            )
+                set_pending_structured_rows(structured_rows)
 
-            st.session_state.messages.append({"role": "user", "content": user_msg})
-            st.session_state["_pending_file_msg"] = user_msg
-            st.rerun()
+                prompt_text = load_prompt_text()
+                header = (
+                    f"File: **{uploaded_file.name}**\n"
+                    f"Eligible structured rows: **{len(structured_rows)}**"
+                )
+                user_msg = (
+                    f"{header}\n\n"
+                    f"{prompt_text}\n\n"
+                    "Call analyze_structured_survey with NO arguments so it uses the full uploaded dataset."
+                )
 
-        # Fabric query mode — agent calls Fabric Data Agent tool directly
+                st.session_state.messages.append({"role": "user", "content": user_msg})
+                st.session_state["_pending_file_msg"] = user_msg
+                st.rerun()
+
         if data_source == "Fabric Semantic Model" and fabric_query and st.button("Query & Analyze", type="primary", use_container_width=True):
             user_msg = (
                 f"Use the fabric_dataagent tool now to query the semantic model: {fabric_query}\n\n"
@@ -533,7 +683,7 @@ def main() -> None:
                 "4. Key Drivers of Positive Sentiment (table with top strengths)\n"
                 "5. Insight-Driven Recommendations (numbered, with Why/Recommendation format)"
             )
-            
+
             st.session_state.messages.append({"role": "user", "content": f"Query: {fabric_query}"})
             st.session_state["_pending_fabric_msg"] = user_msg
             st.rerun()
@@ -546,37 +696,29 @@ def main() -> None:
         st.divider()
         st.caption(f"Thread: `{st.session_state.get('thread_id', '...')}`")
 
-    # ── Main chat area ────────────────────────────────────────────────────────
     st.title("Survey Sentiment Agent")
-    st.caption(
-        "Powered by Azure AI Foundry · Azure Language MCP · GPT-4o"
-    )
+    st.caption("Powered by Azure AI Foundry · Azure Language MCP · GPT-4o")
 
-    # Render message history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Show placeholder when no messages yet
     if not st.session_state.messages:
         with st.chat_message("assistant"):
             if fabric_enabled:
                 st.markdown(
                     "👋 Hi! I'm your Survey Analysis Agent. You can:\n\n"
-                    "- **Upload an Excel file** in the sidebar for analysis\n"
+                    "- **Upload an Excel file** and map required survey fields\n"
                     "- **Query Fabric data** using natural language\n"
-                    "- **Type a message** below — paste responses directly or ask questions\n\n"
-                    "Try: *'Analyse: Great service! / Very slow delivery / Best experience ever'*"
+                    "- **Type a message** below — paste responses directly or ask questions"
                 )
             else:
                 st.markdown(
                     "👋 Hi! I'm your Survey Analysis Agent. You can:\n\n"
-                    "- **Upload an Excel file** in the sidebar for full analysis\n"
-                    "- **Type a message** below — paste responses directly or ask questions\n\n"
-                    "Try: *'Analyse: Great service! / Very slow delivery / Best experience ever'*"
+                    "- **Upload an Excel file** and map required survey fields\n"
+                    "- **Type a message** below — paste responses directly or ask questions"
                 )
 
-    # ── Run file analysis (outside sidebar so st.status renders in main area)
     if st.session_state.get("_pending_file_msg"):
         user_msg = st.session_state.pop("_pending_file_msg")
         with st.chat_message("assistant"):
@@ -586,7 +728,6 @@ def main() -> None:
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
-    # ── Run Fabric query (outside sidebar) ────────────────────────────────
     if st.session_state.get("_pending_fabric_msg"):
         user_msg = st.session_state.pop("_pending_fabric_msg")
         with st.chat_message("assistant"):
@@ -596,7 +737,6 @@ def main() -> None:
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
-    # Chat input
     if prompt := st.chat_input("Ask the agent or paste survey responses..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):

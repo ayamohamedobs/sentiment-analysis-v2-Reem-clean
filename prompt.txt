@@ -1,0 +1,87 @@
+Analyze the uploaded survey XLSX file.
+
+The dataset contains messy and non-sequential survey data.
+
+Use these fields together:
+- Survey response ID
+- Question: name
+- Response value
+
+Do NOT analyze Response value in isolation.
+
+Requirements:
+- process ALL rows
+- reconstruct relationships between responses
+- use Survey response ID to group related answers
+- use Question: name to determine context and main cluster
+- normalize sentiment to Positive / Neutral / Negative
+- assign ONE main cluster per response
+- extract one Primary Sub-theme and optionally one Secondary Sub-theme from free-text only
+- use ratings for sentiment only
+- link follow-up responses even if they are not sequential
+- build key drivers from grouped sub-themes grounded in verbatim
+
+Critical rule:
+- Primary Sub-theme and Secondary Sub-theme must come from verbatim
+- key drivers must come from grouped verbatim-derived sub-themes
+- summaries must synthesize what customers are actually saying
+- recommendations must be grounded in verbatim-derived drivers
+
+Use only the approved Main Cluster labels exactly as defined.
+Do not merge or rename cluster labels.
+
+Use stable canonical labels for positive and negative drivers.
+Normalize similar driver labels into one consistent label before generating the final tables.
+
+For the overview section:
+- include total number of surveys analyzed
+- include survey-level sentiment breakdown with BOTH counts and percentages
+- include total number of responses analyzed
+- include response-level sentiment breakdown with BOTH counts and percentages
+
+For the key driver sections:
+- after the negative-driver table, include concise context summaries by relevant main cluster
+- after the positive-driver table, include concise context summaries by relevant main cluster
+- in those summaries, mention specific tools, portals, products, workflows, processes, or product features when they are clearly referenced in customer comments
+- keep the summaries concise and actionable
+- do not use vague wording when a specific callout is available from the verbatim
+
+At the end of the output:
+- include a validation table showing all analyzed responses and their assigned tags
+
+The validation table must include:
+- Survey response ID
+- Question: name
+- Response value
+- Main Cluster
+- Primary Sub-theme
+- Secondary Sub-theme
+- Response Sentiment
+- Survey-Level Sentiment
+
+When summarizing:
+- do NOT restate tables
+- do NOT rely on percentages alone
+- explain what customers are actually saying
+
+Provide output in this structure:
+1. Customer Sentiment Overview
+2. Where Sentiment Breaks Down
+3. Key Drivers of Negative Sentiment
+   - include the table
+   - then include a context summary with short paragraphs by relevant main cluster
+4. Key Drivers of Positive Sentiment
+   - include the table
+   - then include a context summary with short paragraphs by relevant main cluster
+5. Insight-Driven Recommendations
+
+Include coverage summary:
+- total rows
+- eligible rows
+- rating rows
+- free-text rows
+- processed rows
+- failed rows
+- coverage %
+
+Keep output concise, structured, and executive-ready.

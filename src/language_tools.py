@@ -4,9 +4,6 @@ Azure AI Language SDK tool implementations.
 Used when LANGUAGE_TOOL_MODE=sdk (the default).
 The agent declares these as function tools; the app intercepts required_action
 runs, executes the appropriate function here, and submits the output back.
-
-Switch to LANGUAGE_TOOL_MODE=mcp once the Foundry Agent Service supports
-Streamable HTTP MCP transport (currently POST-only, Agent Service uses SSE GET).
 """
 
 from __future__ import annotations
@@ -14,33 +11,47 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections import Counter, defaultdict
 from functools import lru_cache
 from typing import Any
 
-from azure.identity import DefaultAzureCredential
 from azure.ai.textanalytics import TextAnalyticsClient
+from azure.identity import DefaultAzureCredential
 
-
-# Pending file-uploaded documents are stored in-process so the agent can call
-# analyze_sentiment without embedding hundreds of rows into the LLM context.
+# Pending file-uploaded text documents (legacy flow)
 _pending_documents: list[str] | None = None
+
+# Pending structured survey rows (new flow)
+_pending_structured_rows: list[dict[str, Any]] | None = None
 
 
 def set_pending_documents(documents: list[str]) -> None:
-    """Store uploaded documents for the next tool call."""
+    """Store uploaded text documents for the next legacy tool call."""
     global _pending_documents
     _pending_documents = [str(d) for d in documents]
 
 
 def _take_pending_documents() -> list[str] | None:
-    """Return and clear pending uploaded documents."""
+    """Return and clear pending uploaded text documents."""
     global _pending_documents
     docs = _pending_documents
     _pending_documents = None
     return docs
 
 
-# ─── Client ──────────────────────────────────────────────────────────────────
+def set_pending_structured_rows(rows: list[dict[str, Any]]) -> None:
+    """Store uploaded structured survey rows for the next tool call."""
+    global _pending_structured_rows
+    _pending_structured_rows = [dict(r) for r in rows]
+
+
+def _take_pending_structured_rows() -> list[dict[str, Any]] | None:
+    """Return and clear pending uploaded structured survey rows."""
+    global _pending_structured_rows
+    rows = _pending_structured_rows
+    _pending_structured_rows = None
+    return rows
+
 
 @lru_cache(maxsize=1)
 def _get_client() -> TextAnalyticsClient:
@@ -49,7 +60,7 @@ def _get_client() -> TextAnalyticsClient:
 
 
 def _docs(documents: Any) -> list[str]:
-    """Accept either a JSON string or a Python list."""
+    """Accept either a JSON string or a Python list of documents."""
     if isinstance(documents, str):
         try:
             documents = json.loads(documents)
@@ -58,331 +69,439 @@ def _docs(documents: Any) -> list[str]:
     return [str(d) for d in documents]
 
 
-def _chunked(lst: list[str], size: int = 10):
-    """Yield successive chunks of `size` from `lst`."""
+def _rows(rows: Any) -> list[dict[str, Any]]:
+    """Accept either a JSON string or a Python list of row objects."""
+    if isinstance(rows, str):
+        try:
+            rows = json.loads(rows)
+        except json.JSONDecodeError:
+            rows = []
+    if not isinstance(rows, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            normalized.append(dict(row))
+    return normalized
+
+
+def _chunked(lst: list[Any], size: int = 10):
     for i in range(0, len(lst), size):
         yield lst[i : i + size]
 
 
-def _canonical_section2_theme(target: str) -> str | None:
-    """Map noisy opinion targets into stable Section 2 theme clusters."""
-    t = re.sub(r"\s+", " ", target.strip().lower())
-    if not t:
-        return None
-
-    if any(k in t for k in ["billing", "payment", "invoice", "account", "subscription"]):
-        return "Billing & Account"
-    if any(k in t for k in ["knowledge base", "kb", "documentation", "article", "search", "manual"]):
-        return "Documentation & Knowledge Base"
-    if any(k in t for k in ["ui", "ux", "mobile", "app", "interface", "tool", "feature", "functionality"]):
-        return "Product Experience"
-    if any(k in t for k in ["response", "follow-up", "follow up", "communication", "resolution", "escalation", "ticket", "wait", "support", "engineer", "service"]):
-        return "Support Operations"
-
-    # Ignore one-word generic noise tokens to avoid misleading tiny rows.
-    if len(t.split()) == 1 and t in {"issue", "problem", "team", "customer", "system"}:
-        return None
-
-    return "Other"
+def _is_blank(value: Any) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    return text == "" or text.lower() in {"na", "n/a", "none", "null", "nan"}
 
 
-def _pretty_label(text: str) -> str:
-    """Convert raw target text to a readable label for report tables."""
-    cleaned = re.sub(r"\s+", " ", text.strip())
-    return cleaned.title()
+def _normalize_text(value: Any) -> str:
+    return "" if _is_blank(value) else str(value).strip()
 
 
-# ─── Tool implementations ─────────────────────────────────────────────────────
+# ─── Structured survey helpers ───────────────────────────────────────────────
+
+_RATING_SENTIMENT_MAP: dict[str, str] = {
+    "totally satisfied": "Positive",
+    "strongly agree": "Positive",
+    "agree": "Positive",
+    "very satisfied": "Positive",
+    "somewhat satisfied": "Positive",
+    "neither satisfied nor dissatisfied": "Neutral",
+    "neither agree nor disagree": "Neutral",
+    "somewhat dissatisfied": "Negative",
+    "disagree": "Negative",
+    "very dissatisfied": "Negative",
+    "totally dissatisfied": "Negative",
+    "strongly disagree": "Negative",
+}
+
+_MAIN_CLUSTERS = [
+    "Product Satisfaction",
+    "Tools",
+    "Overall Service Delivery",
+    "Technical Support Quality",
+    "Communication",
+    "Documentation & Knowledge base",
+]
+
+
+def _normalize_for_match(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _detect_response_type(response_value: str) -> str:
+    if _normalize_for_match(response_value) in _RATING_SENTIMENT_MAP:
+        return "structured_rating"
+    return "free_text"
+
+
+def _map_main_cluster(question_name: str, fields_name: str = "", response_value: str = "") -> str:
+    source = " ".join([question_name, fields_name]).strip().lower()
+
+    if any(k in source for k in ["overall satisfaction", "satisfied with product", "product satisfaction"]):
+        return "Product Satisfaction"
+
+    if any(k in source for k in [
+        "tool",
+        "portal",
+        "navigation",
+        "report",
+        "download",
+        "usability",
+        "feature",
+    ]):
+        return "Tools"
+
+    if any(k in source for k in [
+        "technical support",
+        "engineer",
+        "troubleshooting",
+        "escalation",
+        "expertise",
+        "resolution handling",
+    ]):
+        return "Technical Support Quality"
+
+    if any(k in source for k in [
+        "communication",
+        "update",
+        "status",
+        "time to resolve",
+        "timeliness",
+        "follow-up",
+        "follow up",
+    ]):
+        return "Communication"
+
+    if any(k in source for k in [
+        "documentation",
+        "knowledge base",
+        "kb",
+        "guide",
+        "article",
+        "self-service",
+        "manual",
+    ]):
+        return "Documentation & Knowledge base"
+
+    if any(k in source for k in ["service received", "case experience", "ease of resolving", "service delivery"]):
+        return "Overall Service Delivery"
+
+    # Fallback signal from response text when question text is empty/weak.
+    rv = response_value.lower()
+    if any(k in rv for k in ["documentation", "knowledge base", "article"]):
+        return "Documentation & Knowledge base"
+    if any(k in rv for k in ["tool", "portal", "dashboard", "report"]):
+        return "Tools"
+    if any(k in rv for k in ["engineer", "support", "troubleshoot"]):
+        return "Technical Support Quality"
+    if any(k in rv for k in ["communication", "update", "response time"]):
+        return "Communication"
+
+    return "Overall Service Delivery"
+
+
+def _normalize_sentiment_label(value: str) -> str:
+    low = value.strip().lower()
+    if low == "positive":
+        return "Positive"
+    if low == "neutral":
+        return "Neutral"
+    if low == "negative":
+        return "Negative"
+    if low == "mixed":
+        return "Neutral"
+    return "Neutral"
+
+
+def _determine_survey_sentiment(row_sentiments: list[str]) -> str:
+    score = 0
+    for s in row_sentiments:
+        if s == "Positive":
+            score += 1
+        elif s == "Negative":
+            score -= 1
+
+    if score > 0:
+        return "Positive"
+    if score < 0:
+        return "Negative"
+    return "Neutral"
+
+
+def _pct(count: int, total: int) -> float:
+    return round((count / total) * 100, 1) if total else 0.0
+
+
+# ─── New structured survey tool ──────────────────────────────────────────────
+
+def analyze_structured_survey(
+    rows: Any = None,
+    include_key_phrases: bool = False,
+    include_entities: bool = False,
+) -> str:
+    """Analyze structured survey rows and return row-level enrichment + lightweight aggregates.
+
+    Input rows must contain mapped fields:
+      - survey_response_id
+      - question_name
+      - response_value
+      - fields_name (optional)
+
+    If rows is omitted, pending uploaded rows are used.
+    """
+    client = _get_client()
+
+    source_rows = _rows(rows) if rows is not None else (_take_pending_structured_rows() or [])
+    total_rows = len(source_rows)
+    if not source_rows:
+        return json.dumps({"error": "No structured survey rows provided."}, ensure_ascii=False)
+
+    eligible_rows: list[dict[str, Any]] = []
+    for idx, row in enumerate(source_rows):
+        response_value = _normalize_text(row.get("response_value", ""))
+        if _is_blank(response_value):
+            continue
+
+        eligible_rows.append(
+            {
+                "row_index": idx,
+                "survey_response_id": _normalize_text(row.get("survey_response_id", "")),
+                "question_name": _normalize_text(row.get("question_name", "")),
+                "response_value": response_value,
+                "fields_name": _normalize_text(row.get("fields_name", "")),
+            }
+        )
+
+    if not eligible_rows:
+        return json.dumps(
+            {
+                "coverage": {
+                    "total_rows": total_rows,
+                    "eligible_rows": 0,
+                    "processed_rows": 0,
+                    "failed_rows": 0,
+                    "coverage_pct": 0.0,
+                },
+                "enriched_rows": [],
+                "survey_level_sentiment": {
+                    "total_surveys": 0,
+                    "positive_count": 0,
+                    "neutral_count": 0,
+                    "negative_count": 0,
+                    "positive_pct": 0.0,
+                    "neutral_pct": 0.0,
+                    "negative_pct": 0.0,
+                },
+                "response_level_sentiment": {
+                    "total_responses": 0,
+                    "positive_count": 0,
+                    "neutral_count": 0,
+                    "negative_count": 0,
+                    "positive_pct": 0.0,
+                    "neutral_pct": 0.0,
+                    "negative_pct": 0.0,
+                },
+                "main_cluster_breakdown": [],
+            },
+            ensure_ascii=False,
+        )
+
+    texts_for_sentiment: list[str] = []
+    sentiment_target_indexes: list[int] = []
+
+    for i, row in enumerate(eligible_rows):
+        normalized_value = _normalize_for_match(row["response_value"])
+        mapped = _RATING_SENTIMENT_MAP.get(normalized_value)
+        if mapped:
+            row["response_sentiment"] = mapped
+            row["response_type"] = "structured_rating"
+        else:
+            row["response_type"] = "free_text"
+            texts_for_sentiment.append(row["response_value"])
+            sentiment_target_indexes.append(i)
+
+    failed_rows = 0
+    if texts_for_sentiment:
+        cursor = 0
+        for chunk in _chunked(texts_for_sentiment, 10):
+            results = client.analyze_sentiment(chunk, show_opinion_mining=False)
+            for doc in results:
+                target_idx = sentiment_target_indexes[cursor]
+                if doc.is_error:
+                    eligible_rows[target_idx]["response_sentiment"] = "Neutral"
+                    eligible_rows[target_idx]["analysis_error"] = doc.error.message
+                    failed_rows += 1
+                else:
+                    eligible_rows[target_idx]["response_sentiment"] = _normalize_sentiment_label(doc.sentiment)
+                cursor += 1
+
+    for row in eligible_rows:
+        row["main_cluster"] = _map_main_cluster(
+            question_name=row.get("question_name", ""),
+            fields_name=row.get("fields_name", ""),
+            response_value=row.get("response_value", ""),
+        )
+
+    if include_key_phrases:
+        all_texts = [r["response_value"] for r in eligible_rows]
+        phrase_results: list[list[str]] = [[] for _ in all_texts]
+        cursor = 0
+        for chunk in _chunked(all_texts, 10):
+            results = client.extract_key_phrases(chunk)
+            for doc in results:
+                if not doc.is_error:
+                    phrase_results[cursor] = list(doc.key_phrases)
+                cursor += 1
+        for idx, row in enumerate(eligible_rows):
+            row["key_phrases"] = phrase_results[idx]
+
+    if include_entities:
+        all_texts = [r["response_value"] for r in eligible_rows]
+        entity_results: list[list[dict[str, Any]]] = [[] for _ in all_texts]
+        cursor = 0
+        for chunk in _chunked(all_texts, 10):
+            results = client.recognize_entities(chunk)
+            for doc in results:
+                if not doc.is_error:
+                    entity_results[cursor] = [
+                        {
+                            "text": e.text,
+                            "category": e.category,
+                            "subcategory": e.subcategory,
+                            "confidence": round(e.confidence_score, 3),
+                        }
+                        for e in doc.entities
+                    ]
+                cursor += 1
+        for idx, row in enumerate(eligible_rows):
+            row["entities"] = entity_results[idx]
+
+    # Survey-level sentiment
+    survey_buckets: dict[str, list[str]] = defaultdict(list)
+    for row in eligible_rows:
+        sid = row.get("survey_response_id") or ""
+        survey_key = sid if sid else f"__row_{row['row_index']}"
+        survey_buckets[survey_key].append(row["response_sentiment"])
+
+    survey_sentiment_by_id: dict[str, str] = {}
+    for survey_id, sentiments in survey_buckets.items():
+        survey_sentiment_by_id[survey_id] = _determine_survey_sentiment(sentiments)
+
+    for row in eligible_rows:
+        sid = row.get("survey_response_id") or ""
+        survey_key = sid if sid else f"__row_{row['row_index']}"
+        row["survey_level_sentiment"] = survey_sentiment_by_id[survey_key]
+
+    # Response-level aggregate
+    response_counter = Counter(row["response_sentiment"] for row in eligible_rows)
+    total_responses = len(eligible_rows)
+    response_level_sentiment = {
+        "total_responses": total_responses,
+        "positive_count": int(response_counter.get("Positive", 0)),
+        "neutral_count": int(response_counter.get("Neutral", 0)),
+        "negative_count": int(response_counter.get("Negative", 0)),
+        "positive_pct": _pct(int(response_counter.get("Positive", 0)), total_responses),
+        "neutral_pct": _pct(int(response_counter.get("Neutral", 0)), total_responses),
+        "negative_pct": _pct(int(response_counter.get("Negative", 0)), total_responses),
+    }
+
+    # Survey-level aggregate
+    survey_counter = Counter(survey_sentiment_by_id.values())
+    total_surveys = len(survey_sentiment_by_id)
+    survey_level_sentiment = {
+        "total_surveys": total_surveys,
+        "positive_count": int(survey_counter.get("Positive", 0)),
+        "neutral_count": int(survey_counter.get("Neutral", 0)),
+        "negative_count": int(survey_counter.get("Negative", 0)),
+        "positive_pct": _pct(int(survey_counter.get("Positive", 0)), total_surveys),
+        "neutral_pct": _pct(int(survey_counter.get("Neutral", 0)), total_surveys),
+        "negative_pct": _pct(int(survey_counter.get("Negative", 0)), total_surveys),
+    }
+
+    # Main cluster breakdown
+    by_cluster: dict[str, Counter[str]] = {cluster: Counter() for cluster in _MAIN_CLUSTERS}
+    for row in eligible_rows:
+        cluster = row.get("main_cluster", "Overall Service Delivery")
+        sentiment = row.get("response_sentiment", "Neutral")
+        if cluster not in by_cluster:
+            by_cluster[cluster] = Counter()
+        by_cluster[cluster][sentiment] += 1
+
+    main_cluster_breakdown: list[dict[str, Any]] = []
+    for cluster, counter in by_cluster.items():
+        total_mentions = int(sum(counter.values()))
+        if total_mentions == 0:
+            continue
+        pos = int(counter.get("Positive", 0))
+        neu = int(counter.get("Neutral", 0))
+        neg = int(counter.get("Negative", 0))
+        main_cluster_breakdown.append(
+            {
+                "main_cluster": cluster,
+                "positive_count": pos,
+                "neutral_count": neu,
+                "negative_count": neg,
+                "total_mentions": total_mentions,
+                "positive_pct": _pct(pos, total_mentions),
+                "neutral_pct": _pct(neu, total_mentions),
+                "negative_pct": _pct(neg, total_mentions),
+            }
+        )
+
+    main_cluster_breakdown.sort(key=lambda x: (-x["total_mentions"], x["main_cluster"]))
+
+    coverage = {
+        "total_rows": total_rows,
+        "eligible_rows": len(eligible_rows),
+        "processed_rows": len(eligible_rows),
+        "failed_rows": failed_rows,
+        "coverage_pct": _pct(len(eligible_rows), len(eligible_rows)) if eligible_rows else 0.0,
+    }
+
+    payload = {
+        "coverage": coverage,
+        "survey_level_sentiment": survey_level_sentiment,
+        "response_level_sentiment": response_level_sentiment,
+        "main_cluster_breakdown": main_cluster_breakdown,
+        "enriched_rows": eligible_rows,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+# ─── Legacy tools (kept for compatibility) ───────────────────────────────────
 
 def analyze_sentiment(documents: Any = None) -> str:
-    """Analyse sentiment and mine opinions for each document.
-
-    Accepts explicit `documents` or uses pending uploaded documents when called
-    with no arguments.
-    """
+    """Legacy sentiment tool: analyze free-text documents."""
     client = _get_client()
     docs = _docs(documents) if documents else (_take_pending_documents() or [])
     if not docs:
         return json.dumps({"error": "No documents provided."}, ensure_ascii=False)
 
-    # Small payload: keep full per-document detail for richer chat responses.
-    if len(docs) <= 10:
-        output = []
-        results = client.analyze_sentiment(docs, show_opinion_mining=True)
-        for i, doc in enumerate(results):
-            if doc.is_error:
-                output.append({"index": i, "error": doc.error.message})
-                continue
-            sentences = []
-            for sent in doc.sentences:
-                s: dict[str, Any] = {
-                    "text": sent.text,
-                    "sentiment": sent.sentiment,
-                    "confidence": {
-                        "positive": round(sent.confidence_scores.positive, 3),
-                        "neutral": round(sent.confidence_scores.neutral, 3),
-                        "negative": round(sent.confidence_scores.negative, 3),
-                    },
-                    "opinions": [],
-                }
-                for mined in sent.mined_opinions:
-                    s["opinions"].append({
-                        "target": mined.target.text,
-                        "sentiment": mined.target.sentiment,
-                        "assessments": [
-                            {"text": a.text, "sentiment": a.sentiment}
-                            for a in mined.assessments
-                        ],
-                    })
-                sentences.append(s)
-            output.append({
-                "index": i,
-                "text": docs[i],
-                "sentiment": doc.sentiment,
-                "confidence": {
-                    "positive": round(doc.confidence_scores.positive, 3),
-                    "neutral": round(doc.confidence_scores.neutral, 3),
-                    "negative": round(doc.confidence_scores.negative, 3),
-                },
-                "sentences": sentences,
-            })
-        return json.dumps(output, ensure_ascii=False)
-
-    # Large payload: process all documents in 10-doc chunks and return compact
-    # aggregate metrics so the LLM can reason over the full dataset.
-    sentiments: list[str] = []
-    errors = 0
-    opinion_targets: dict[str, dict[str, int]] = {}
-    opinion_assessments: dict[str, dict[str, int]] = {}
-    # Theme -> document sentiment counts for responses mentioning the theme.
-    theme_doc_sentiments: dict[str, dict[str, int]] = {}
-    # Canonical Section 2 clusters aggregated across noisy targets.
-    section2_cluster_mentions: dict[str, int] = {}
-    section2_cluster_doc_sentiments: dict[str, dict[str, int]] = {}
-    negative_samples: list[str] = []
-    positive_samples: list[str] = []
-
-    idx = 0
+    output = []
     for chunk in _chunked(docs, 10):
         results = client.analyze_sentiment(chunk, show_opinion_mining=True)
-        for doc in results:
+        for i, doc in enumerate(results):
+            text = chunk[i]
             if doc.is_error:
-                errors += 1
-                idx += 1
+                output.append({"text": text, "error": doc.error.message})
                 continue
-
-            sentiments.append(doc.sentiment)
-            if doc.sentiment == "negative" and len(negative_samples) < 10:
-                negative_samples.append(docs[idx][:200])
-            elif doc.sentiment == "positive" and len(positive_samples) < 10:
-                positive_samples.append(docs[idx][:200])
-
-            doc_targets: set[str] = set()
-            doc_clusters: set[str] = set()
-            for sent in doc.sentences:
-                for mined in sent.mined_opinions:
-                    target = mined.target.text.lower()
-                    t_sent = mined.target.sentiment
-                    doc_targets.add(target)
-                    opinion_targets.setdefault(target, {"positive": 0, "neutral": 0, "negative": 0})
-                    opinion_targets[target][t_sent] = opinion_targets[target].get(t_sent, 0) + 1
-                    opinion_assessments.setdefault(target, {})
-                    for a in mined.assessments:
-                        key = a.text.lower()
-                        opinion_assessments[target][key] = opinion_assessments[target].get(key, 0) + 1
-
-                    cluster = _canonical_section2_theme(target)
-                    if cluster:
-                        section2_cluster_mentions[cluster] = section2_cluster_mentions.get(cluster, 0) + 1
-                        doc_clusters.add(cluster)
-
-            # Distribute document-level sentiment to each theme mentioned by this document.
-            for target in doc_targets:
-                theme_doc_sentiments.setdefault(target, {"positive": 0, "neutral": 0, "negative": 0, "mixed": 0})
-                if doc.sentiment in theme_doc_sentiments[target]:
-                    theme_doc_sentiments[target][doc.sentiment] += 1
-
-            # Distribute document sentiment once per canonical cluster.
-            for cluster in doc_clusters:
-                section2_cluster_doc_sentiments.setdefault(cluster, {"positive": 0, "neutral": 0, "negative": 0, "mixed": 0})
-                if doc.sentiment in section2_cluster_doc_sentiments[cluster]:
-                    section2_cluster_doc_sentiments[cluster][doc.sentiment] += 1
-            idx += 1
-
-    total = len(sentiments)
-    pos = sentiments.count("positive")
-    neu = sentiments.count("neutral")
-    neg = sentiments.count("negative")
-    mixed = sentiments.count("mixed")
-
-    # Keep meaningful themes while avoiding collapse to a single row.
-    # Threshold is adaptive (~0.5% of responses, minimum 3 mentions).
-    min_theme_mentions = max(3, int(round(total * 0.005))) if total else 3
-    sorted_targets = sorted(opinion_targets.items(), key=lambda x: sum(x[1].values()), reverse=True)
-    filtered_targets = [(t, c) for t, c in sorted_targets if sum(c.values()) >= min_theme_mentions]
-    # If filter is too strict for this dataset, fall back to top themes.
-    if len(filtered_targets) < 8:
-        filtered_targets = sorted_targets[:12]
-
-    themes = []
-    for target, counts in filtered_targets:
-        t_total = sum(counts.values())
-        doc_counts = theme_doc_sentiments.get(target, {"positive": 0, "neutral": 0, "negative": 0, "mixed": 0})
-        t_doc_total = sum(doc_counts.values())
-        pos_pct = round((doc_counts.get("positive", 0) / t_doc_total) * 100, 1) if t_doc_total else 0
-        neu_pct = round((doc_counts.get("neutral", 0) / t_doc_total) * 100, 1) if t_doc_total else 0
-        neg_pct = round((doc_counts.get("negative", 0) / t_doc_total) * 100, 1) if t_doc_total else 0
-        top_assessments = sorted(opinion_assessments.get(target, {}).items(), key=lambda x: x[1], reverse=True)[:5]
-        themes.append({
-            "target": target,
-            "mentions": t_total,
-            "responses_with_theme": t_doc_total,
-            "positive": doc_counts.get("positive", 0),
-            "neutral": doc_counts.get("neutral", 0),
-            "negative": doc_counts.get("negative", 0),
-            "mixed": doc_counts.get("mixed", 0),
-            "positive_pct_within_theme": pos_pct,
-            "neutral_pct_within_theme": neu_pct,
-            "negative_pct_within_theme": neg_pct,
-            "mixed_pct_within_theme": round((doc_counts.get("mixed", 0) / t_doc_total) * 100, 1) if t_doc_total else 0,
-            "share_of_all_responses_pct": round((t_doc_total / total) * 100, 1) if total else 0,
-            "positive_share_of_all_responses_pct": round((doc_counts.get("positive", 0) / total) * 100, 1) if total else 0,
-            "neutral_share_of_all_responses_pct": round((doc_counts.get("neutral", 0) / total) * 100, 1) if total else 0,
-            "negative_share_of_all_responses_pct": round((doc_counts.get("negative", 0) / total) * 100, 1) if total else 0,
-            "top_assessments": [f"{txt} ({cnt})" for txt, cnt in top_assessments],
-        })
-        if len(themes) >= 20:
-            break
-
-    # Build Section 2 from canonical clusters (not raw target fragments).
-    section2_rows = []
-    for cluster, doc_counts in section2_cluster_doc_sentiments.items():
-        c_doc_total = sum(doc_counts.values())
-        if c_doc_total == 0:
-            continue
-        pos_pct = round((doc_counts.get("positive", 0) / c_doc_total) * 100, 1)
-        neu_pct = round((doc_counts.get("neutral", 0) / c_doc_total) * 100, 1)
-        neg_pct = round((doc_counts.get("negative", 0) / c_doc_total) * 100, 1)
-        pos_count = doc_counts.get("positive", 0)
-        neu_count = doc_counts.get("neutral", 0)
-        neg_count = doc_counts.get("negative", 0)
-        section2_rows.append({
-            "theme": cluster,
-            "mentions": section2_cluster_mentions.get(cluster, 0),
-            "responses_with_theme": c_doc_total,
-            "positive_count": pos_count,
-            "neutral_count": neu_count,
-            "negative_count": neg_count,
-            "positive_pct": pos_pct,
-            "neutral_pct": neu_pct,
-            "negative_pct": neg_pct,
-            "positive_display": f"{pos_count} ({pos_pct:.1f}%)",
-            "neutral_display": f"{neu_count} ({neu_pct:.1f}%)",
-            "negative_display": f"{neg_count} ({neg_pct:.1f}%)",
-        })
-
-    section2_rows = sorted(section2_rows, key=lambda r: r["responses_with_theme"], reverse=True)
-
-    # Section 2 must be a single table with no high/low-volume split.
-    min_section2_responses = 0
-    section2_primary_rows = section2_rows
-    section2_low_volume_rows: list[dict[str, Any]] = []
-
-    # Build deterministic Section 3/4 tables from opinion-target sentiment counts.
-    total_negative_target_mentions = sum(c.get("negative", 0) for c in opinion_targets.values())
-    total_positive_target_mentions = sum(c.get("positive", 0) for c in opinion_targets.values())
-
-    section3_negative_drivers = []
-    for target, counts in sorted(opinion_targets.items(), key=lambda x: x[1].get("negative", 0), reverse=True):
-        neg_count = counts.get("negative", 0)
-        if neg_count <= 0:
-            continue
-        section3_negative_drivers.append({
-            "issue_cluster": _pretty_label(target),
-            "primary_theme": _canonical_section2_theme(target) or "Other",
-            "mentions": neg_count,
-            "share_of_negative_sentiment_pct": round((neg_count / total_negative_target_mentions) * 100, 1)
-            if total_negative_target_mentions
-            else 0,
-        })
-        if len(section3_negative_drivers) >= 5:
-            break
-
-    section4_positive_drivers = []
-    for target, counts in sorted(opinion_targets.items(), key=lambda x: x[1].get("positive", 0), reverse=True):
-        pos_count = counts.get("positive", 0)
-        if pos_count <= 0:
-            continue
-        section4_positive_drivers.append({
-            "positive_driver": _pretty_label(target),
-            "mentions": pos_count,
-            "share_of_positive_impact_pct": round((pos_count / total_positive_target_mentions) * 100, 1)
-            if total_positive_target_mentions
-            else 0,
-        })
-        if len(section4_positive_drivers) >= 5:
-            break
-
-    summary = {
-        "total_documents": total,
-        "errors": errors,
-        "sentiment_distribution": {
-            "positive": pos,
-            "neutral": neu,
-            "negative": neg,
-            "mixed": mixed,
-            "positive_pct": round(pos / total * 100, 1) if total else 0,
-            "neutral_pct": round(neu / total * 100, 1) if total else 0,
-            "negative_pct": round(neg / total * 100, 1) if total else 0,
-        },
-        "opinion_themes": themes,
-        # Deterministic table payload for Section 2 rendering.
-        "section_2_table_rows": [
-            {
-                "theme": t["theme"],
-                "mentions": t["mentions"],
-                "responses_with_theme": t["responses_with_theme"],
-                "positive_count": t["positive_count"],
-                "neutral_count": t["neutral_count"],
-                "negative_count": t["negative_count"],
-                "positive_pct": t["positive_pct"],
-                "neutral_pct": t["neutral_pct"],
-                "negative_pct": t["negative_pct"],
-                "positive_display": t["positive_display"],
-                "neutral_display": t["neutral_display"],
-                "negative_display": t["negative_display"],
-                "low_volume": False,
-            }
-            for t in section2_primary_rows
-        ],
-        # Kept for transparency so all raw rows remain available.
-        "section_2_low_volume_rows": [
-            {
-                "theme": t["theme"],
-                "mentions": t["mentions"],
-                "responses_with_theme": t["responses_with_theme"],
-                "positive_count": t["positive_count"],
-                "neutral_count": t["neutral_count"],
-                "negative_count": t["negative_count"],
-                "positive_pct": t["positive_pct"],
-                "neutral_pct": t["neutral_pct"],
-                "negative_pct": t["negative_pct"],
-                "positive_display": t["positive_display"],
-                "neutral_display": t["neutral_display"],
-                "negative_display": t["negative_display"],
-                "low_volume": True,
-            }
-            for t in section2_low_volume_rows
-        ],
-        "section_2_min_responses_threshold": min_section2_responses,
-        "section_2_reliable_row_count": len(section2_primary_rows),
-        "section_2_low_volume_row_count": len(section2_low_volume_rows),
-        "section_3_negative_drivers": section3_negative_drivers,
-        "section_3_negative_denominator_mentions": total_negative_target_mentions,
-        "section_4_positive_drivers": section4_positive_drivers,
-        "section_4_positive_denominator_mentions": total_positive_target_mentions,
-    }
-    return json.dumps(summary, ensure_ascii=False)
+            output.append(
+                {
+                    "text": text,
+                    "sentiment": _normalize_sentiment_label(doc.sentiment),
+                    "confidence": {
+                        "positive": round(doc.confidence_scores.positive, 3),
+                        "neutral": round(doc.confidence_scores.neutral, 3),
+                        "negative": round(doc.confidence_scores.negative, 3),
+                    },
+                }
+            )
+    return json.dumps(output, ensure_ascii=False)
 
 
 def extract_key_phrases(documents: Any) -> str:
@@ -409,19 +528,21 @@ def recognize_entities(documents: Any) -> str:
         if doc.is_error:
             output.append({"index": i, "error": doc.error.message})
         else:
-            output.append({
-                "index": i,
-                "text": docs[i],
-                "entities": [
-                    {
-                        "text": e.text,
-                        "category": e.category,
-                        "subcategory": e.subcategory,
-                        "confidence": round(e.confidence_score, 3),
-                    }
-                    for e in doc.entities
-                ],
-            })
+            output.append(
+                {
+                    "index": i,
+                    "text": docs[i],
+                    "entities": [
+                        {
+                            "text": e.text,
+                            "category": e.category,
+                            "subcategory": e.subcategory,
+                            "confidence": round(e.confidence_score, 3),
+                        }
+                        for e in doc.entities
+                    ],
+                }
+            )
     return json.dumps(output, ensure_ascii=False)
 
 
@@ -435,13 +556,15 @@ def detect_language(documents: Any) -> str:
         if doc.is_error:
             output.append({"index": i, "error": doc.error.message})
         else:
-            output.append({
-                "index": i,
-                "text": docs[i],
-                "language": doc.primary_language.name,
-                "iso6391_name": doc.primary_language.iso6391_name,
-                "confidence": round(doc.primary_language.confidence_score, 3),
-            })
+            output.append(
+                {
+                    "index": i,
+                    "text": docs[i],
+                    "language": doc.primary_language.name,
+                    "iso6391_name": doc.primary_language.iso6391_name,
+                    "confidence": round(doc.primary_language.confidence_score, 3),
+                }
+            )
     return json.dumps(output, ensure_ascii=False)
 
 
@@ -455,25 +578,28 @@ def recognize_pii_entities(documents: Any) -> str:
         if doc.is_error:
             output.append({"index": i, "error": doc.error.message})
         else:
-            output.append({
-                "index": i,
-                "text": docs[i],
-                "redacted_text": doc.redacted_text,
-                "entities": [
-                    {
-                        "text": e.text,
-                        "category": e.category,
-                        "confidence": round(e.confidence_score, 3),
-                    }
-                    for e in doc.entities
-                ],
-            })
+            output.append(
+                {
+                    "index": i,
+                    "text": docs[i],
+                    "redacted_text": doc.redacted_text,
+                    "entities": [
+                        {
+                            "text": e.text,
+                            "category": e.category,
+                            "confidence": round(e.confidence_score, 3),
+                        }
+                        for e in doc.entities
+                    ],
+                }
+            )
     return json.dumps(output, ensure_ascii=False)
 
 
 # ─── Dispatch table ───────────────────────────────────────────────────────────
 
 TOOL_DISPATCH: dict[str, Any] = {
+    "analyze_structured_survey": analyze_structured_survey,
     "analyze_sentiment": analyze_sentiment,
     "extract_key_phrases": extract_key_phrases,
     "recognize_entities": recognize_entities,
@@ -481,9 +607,50 @@ TOOL_DISPATCH: dict[str, Any] = {
     "recognize_pii_entities": recognize_pii_entities,
 }
 
-# ─── Function tool definitions (OpenAI function-calling schema) ───────────────
+
+# ─── Function tool definitions (OpenAI function-calling schema) ─────────────
 
 TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_structured_survey",
+            "description": (
+                "Analyze mapped structured survey rows and return row-level enrichment "
+                "with coverage, sentiment aggregates, and main-cluster breakdown."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "survey_response_id": {"type": "string"},
+                                "question_name": {"type": "string"},
+                                "response_value": {"type": "string"},
+                                "fields_name": {"type": "string"},
+                            },
+                            "required": ["survey_response_id", "question_name", "response_value"],
+                        },
+                        "description": "Mapped structured survey rows. Optional when pending rows are already uploaded.",
+                    },
+                    "include_key_phrases": {
+                        "type": "boolean",
+                        "description": "Include key phrase extraction for each row.",
+                        "default": False,
+                    },
+                    "include_entities": {
+                        "type": "boolean",
+                        "description": "Include entity extraction for each row.",
+                        "default": False,
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
