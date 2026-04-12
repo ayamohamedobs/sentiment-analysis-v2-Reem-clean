@@ -11,8 +11,10 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import time
+from datetime import datetime
 from typing import Any
 
 # .env values OVERRIDE existing env vars to avoid stale terminal sessions
@@ -122,6 +124,7 @@ def _suggest_mapping(columns: list[str], field_key: str) -> str | None:
         ],
         "response_value": [
             "response value",
+            "response text",
             "response",
             "answer",
             "comment",
@@ -232,6 +235,9 @@ def reset_thread(client: AIProjectClient) -> None:
     thread = client.agents.threads.create()
     st.session_state.thread_id = thread.id
     st.session_state.messages = []
+    st.session_state.pop("_pdf_cache", None)
+    st.session_state.pop("_last_agent_reply", None)
+    st.session_state.pop("_last_structured_survey_full_payload", None)
     st.success("New conversation started.")
 
 
@@ -377,6 +383,12 @@ def _prepare_tool_output_for_submit(fn_name: str, result: str) -> str:
         return result
 
     st.session_state["_last_structured_survey_full_payload"] = payload
+
+    # Back up full enriched rows from language_tools for follow-up queries
+    from language_tools import _last_enriched_rows
+    if _last_enriched_rows:
+        st.session_state["_all_enriched_rows"] = _last_enriched_rows
+        print(f"💾 Backed up {len(_last_enriched_rows)} enriched rows to session state")
 
     # Debug: Inspect each candidate key path
     print(f"\n   Inspecting row candidates:")
@@ -550,7 +562,7 @@ def _build_tool_outputs(run, client: AIProjectClient, thread_id: str, status_wid
 def _wait_for_run(client: AIProjectClient, thread_id: str, run, status_widget=None, task: str = "chat") -> object:
     """Poll run to completion, handling SDK function tool calls."""
     terminal = {"completed", "failed", "cancelled", "expired"}
-    deadline = time.time() + 300
+    deadline = time.time() + 600
     t_start = time.time()
     t_phase = t_start
 
@@ -569,7 +581,7 @@ def _wait_for_run(client: AIProjectClient, thread_id: str, run, status_widget=No
             except Exception:
                 pass
             run._data["status"] = "failed"
-            run._data["last_error"] = {"code": "timeout", "message": "Run exceeded 5-minute timeout."}
+            run._data["last_error"] = {"code": "timeout", "message": "Run exceeded 10-minute timeout."}
             rows_processed = int(st.session_state.pop("_rows_processed", 0))
             return run, rows_processed
 
@@ -630,6 +642,7 @@ def send_message(
 ) -> str:
     if task == "file":
         st.session_state.pop("_last_structured_survey_full_payload", None)
+        st.session_state.pop("_pdf_cache", None)
 
     _cancel_active_runs(client, thread_id)
     client.agents.messages.create(thread_id=thread_id, role="user", content=content)
@@ -653,12 +666,170 @@ def send_message(
     return reply
 
 
+# ─── PDF export ───────────────────────────────────────────────────────────────
+
+def _build_pdf_cached(filename: str, agent_reply: str) -> tuple[bytes | None, str]:
+    """
+    Build PDF bytes once and cache them in session state.
+    Returns (pdf_bytes, output_filename) or (None, "") on failure.
+    Re-builds only when the agent reply changes.
+    """
+    payload = st.session_state.get("_last_structured_survey_full_payload")
+    if not isinstance(payload, dict):
+        return None, ""
+
+    # Use reply length + filename as a cheap cache key
+    cache_key = (len(agent_reply), filename)
+    cached = st.session_state.get("_pdf_cache")
+    if cached and cached.get("key") == cache_key:
+        return cached["bytes"], cached["filename"]
+
+    try:
+        from report_pdf import build_pdf
+
+        clean_reply = re.sub(r"\n---\n### Hard Proof Block.*$", "", agent_reply, flags=re.DOTALL)
+        clean_reply = re.sub(r"\n---\n\*Language service processed:.*$", "", clean_reply, flags=re.DOTALL)
+
+        pdf_bytes = build_pdf(
+            payload=payload,
+            agent_reply=clean_reply.strip(),
+            filename=filename,
+        )
+        stem = re.sub(r"\.[^.]+$", "", filename)
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        out_name = f"{stem}_sentiment_report_{ts}.pdf"
+
+        st.session_state["_pdf_cache"] = {"key": cache_key, "bytes": pdf_bytes, "filename": out_name}
+        return pdf_bytes, out_name
+
+    except Exception as exc:
+        st.warning(f"PDF generation failed: {exc}")
+        return None, ""
+
+
+def _offer_pdf_download(filename: str, agent_reply: str, label: str = "📄 Download PDF Report") -> None:
+    """Render a persistent PDF download button in the sidebar using cached bytes."""
+    pdf_bytes, out_name = _build_pdf_cached(filename, agent_reply)
+    if not pdf_bytes:
+        return
+    st.download_button(
+        label=label,
+        data=pdf_bytes,
+        file_name=out_name,
+        # octet-stream forces the browser to save the file instead of opening it
+        mime="application/octet-stream",
+        use_container_width=True,
+        key="sidebar_pdf_download",
+    )
+
+
+# ─── Rich reply renderer ─────────────────────────────────────────────────────
+
+_CHAT_STYLES = """
+<style>
+/* ── Tables ──────────────────────────────────────────── */
+div[data-testid="stChatMessage"] table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.855rem;
+    margin: 0.6rem 0 1.1rem 0;
+    border-radius: 6px;
+    overflow: hidden;
+    box-shadow: 0 1px 5px rgba(0,0,0,0.08);
+}
+div[data-testid="stChatMessage"] th {
+    background: #1B2A4A;
+    color: #e8edf5;
+    padding: 0.5rem 0.8rem;
+    text-align: left;
+    font-weight: 600;
+    white-space: nowrap;
+}
+div[data-testid="stChatMessage"] td {
+    padding: 0.42rem 0.8rem;
+    border-bottom: 1px solid #e8edf0;
+    vertical-align: top;
+    line-height: 1.45;
+}
+div[data-testid="stChatMessage"] tr:nth-child(even) td { background: #f6f9fc; }
+div[data-testid="stChatMessage"] tr:last-child td { border-bottom: none; }
+div[data-testid="stChatMessage"] tr:hover td { background: #edf2fa; }
+/* ── Headings ─────────────────────────────────────────── */
+div[data-testid="stChatMessage"] h2 {
+    color: #1B2A4A;
+    font-size: 1.1rem;
+    font-weight: 700;
+    border-bottom: 2px solid #3498DB;
+    padding-bottom: 0.3rem;
+    margin-top: 1.4rem;
+    margin-bottom: 0.5rem;
+}
+div[data-testid="stChatMessage"] h3 {
+    color: #2C3E50;
+    font-size: 0.97rem;
+    font-weight: 600;
+    margin-top: 0.9rem;
+    margin-bottom: 0.35rem;
+}
+/* ── Blockquotes / verbatim quotes ───────────────────── */
+div[data-testid="stChatMessage"] blockquote {
+    border-left: 3px solid #3498DB;
+    padding: 0.45rem 0.9rem;
+    margin: 0.4rem 0;
+    background: #f0f5fc;
+    border-radius: 0 4px 4px 0;
+    color: #2C3E50;
+    font-style: italic;
+}
+/* ── Code ────────────────────────────────────────────── */
+div[data-testid="stChatMessage"] code {
+    background: #eef2f7;
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+    font-size: 0.84rem;
+}
+/* ── HR ──────────────────────────────────────────────── */
+div[data-testid="stChatMessage"] hr {
+    border: none;
+    border-top: 1px solid #dde3ec;
+    margin: 0.75rem 0;
+}
+/* ── Lists ───────────────────────────────────────────── */
+div[data-testid="stChatMessage"] ol,
+div[data-testid="stChatMessage"] ul {
+    padding-left: 1.4rem;
+    margin: 0.25rem 0 0.65rem 0;
+}
+div[data-testid="stChatMessage"] li { margin-bottom: 0.22rem; line-height: 1.5; }
+</style>
+"""
+
+
+def _inject_chat_styles() -> None:
+    """Inject CSS once per page load to improve chat rendering."""
+    st.markdown(_CHAT_STYLES, unsafe_allow_html=True)
+
+
+def _render_agent_reply(reply: str) -> None:
+    """Render an agent reply: split into ## sections with visual dividers."""
+    if not reply or not reply.strip():
+        return
+    sections = re.split(r"\n(?=## )", reply.strip())
+    for i, section in enumerate(sections):
+        if not section.strip():
+            continue
+        st.markdown(section)
+        if i < len(sections) - 1:
+            st.divider()
+
+
 # ─── UI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     config = load_config()
     client = get_client(config["endpoint"])
     init_session(client)
+    _inject_chat_styles()
 
     with st.sidebar:
         st.title("📊 Survey Analysis")
@@ -667,19 +838,20 @@ def main() -> None:
         st.caption(f"Tools: `{config.get('tool_mode', 'sdk').upper()}`")
         st.divider()
 
-        fabric_enabled = bool(os.environ.get("FABRIC_CONNECTION_NAME"))
+        fabric_enabled = bool(
+            os.environ.get("FABRIC_SQL_ENDPOINT")
+            and os.environ.get("FABRIC_DATABASE")
+        )
         if fabric_enabled:
             data_source = st.radio(
                 "Data Source",
-                ["Local File", "Fabric Semantic Model"],
-                help="Choose between uploading a local file or querying Fabric data",
+                ["Local File", "Fabric Warehouse"],
+                help="Choose between uploading a local file or querying Fabric warehouse",
             )
         else:
             data_source = "Local File"
 
         st.subheader("📁 " + data_source)
-
-        fabric_query = None
 
         if data_source == "Local File":
             uploaded_file = st.file_uploader(
@@ -689,12 +861,6 @@ def main() -> None:
             )
         else:
             uploaded_file = None
-            fabric_query = st.text_area(
-                "Natural Language Query",
-                placeholder="e.g., Get all survey responses from last quarter",
-                help="Describe what data you want to analyze from your Fabric semantic model",
-                height=100,
-            )
 
         file_bytes = None
         if uploaded_file:
@@ -708,31 +874,38 @@ def main() -> None:
             all_cols = [str(c) for c in df_preview.columns]
             df_preview.columns = all_cols
 
-            st.markdown("**Map source columns to required survey fields**")
+            # Auto-map columns; only show manual selectors if auto-mapping fails
             mapping: dict[str, str | None] = {}
             for field_key in _REQUIRED_FIELD_KEYS:
-                suggestion = _suggest_mapping(all_cols, field_key)
-                options = ["— Select column —", *all_cols]
-                default_idx = options.index(suggestion) if suggestion in options else 0
-                selected = st.selectbox(
-                    f"{field_key} *",
-                    options=options,
-                    index=default_idx,
-                    key=f"map_{field_key}",
-                )
-                mapping[field_key] = None if selected == options[0] else selected
+                mapping[field_key] = _suggest_mapping(all_cols, field_key)
 
             optional_key = _OPTIONAL_FIELD_KEYS[0]
-            optional_suggestion = _suggest_mapping(all_cols, optional_key)
-            optional_options = ["— Not provided —", *all_cols]
-            optional_idx = optional_options.index(optional_suggestion) if optional_suggestion in optional_options else 0
-            optional_selected = st.selectbox(
-                f"{optional_key} (optional)",
-                options=optional_options,
-                index=optional_idx,
-                key=f"map_{optional_key}",
-            )
-            mapping[optional_key] = None if optional_selected == optional_options[0] else optional_selected
+            mapping[optional_key] = _suggest_mapping(all_cols, optional_key)
+
+            auto_mapped = all(mapping.get(k) for k in _REQUIRED_FIELD_KEYS)
+            if not auto_mapped:
+                st.markdown("**Map source columns to required survey fields**")
+                for field_key in _REQUIRED_FIELD_KEYS:
+                    suggestion = mapping[field_key]
+                    options = ["— Select column —", *all_cols]
+                    default_idx = options.index(suggestion) if suggestion and suggestion in options else 0
+                    selected = st.selectbox(
+                        f"{field_key} *",
+                        options=options,
+                        index=default_idx,
+                        key=f"map_{field_key}",
+                    )
+                    mapping[field_key] = None if selected == options[0] else selected
+
+                optional_options = ["— Not provided —", *all_cols]
+                optional_idx = optional_options.index(mapping[optional_key]) if mapping.get(optional_key) and mapping[optional_key] in optional_options else 0
+                optional_selected = st.selectbox(
+                    f"{optional_key} (optional)",
+                    options=optional_options,
+                    index=optional_idx,
+                    key=f"map_{optional_key}",
+                )
+                mapping[optional_key] = None if optional_selected == optional_options[0] else optional_selected
 
             if all(mapping.get(k) for k in _REQUIRED_FIELD_KEYS):
                 preview_cols = [mapping[k] for k in _REQUIRED_FIELD_KEYS if mapping[k]]
@@ -780,29 +953,226 @@ def main() -> None:
 
                 st.session_state.messages.append({"role": "user", "content": user_msg})
                 st.session_state["_pending_file_msg"] = user_msg
+                st.session_state["_last_filename"] = uploaded_file.name
                 st.rerun()
 
-        if data_source == "Fabric Semantic Model" and fabric_query and st.button("Query & Analyze", type="primary", use_container_width=True):
-            user_msg = (
-                f"Use the fabric_dataagent tool now to query the semantic model: {fabric_query}\n\n"
-                "After retrieving the data, analyze it using the Language tools "
-                "(analyze_sentiment, extract_key_phrases, recognize_entities — batch up to 10 per call).\n\n"
-                "Present results in this structure:\n"
-                "1. Customer Sentiment Overview (executive summary)\n"
-                "2. Where Sentiment Breaks Down (table with themes and sentiment percentages)\n"
-                "3. Key Drivers of Negative Sentiment (table with top 5 issue clusters)\n"
-                "4. Key Drivers of Positive Sentiment (table with top strengths)\n"
-                "5. Insight-Driven Recommendations (numbered, with Why/Recommendation format)"
-            )
+        # ── Fabric Warehouse flow ──
+        if data_source == "Fabric Warehouse":
+            from fabric_warehouse import list_views, list_columns, load_view, load_distinct_values, count_rows
 
-            st.session_state.messages.append({"role": "user", "content": f"Query: {fabric_query}"})
-            st.session_state["_pending_fabric_msg"] = user_msg
-            st.rerun()
+            default_view = os.environ.get("FABRIC_VIEW", "")
+            try:
+                available_views = list_views()
+            except Exception as exc:
+                st.error(f"Could not connect to Fabric Warehouse: {exc}")
+                available_views = []
+
+            if available_views:
+                default_idx = 0
+                if default_view and default_view in available_views:
+                    default_idx = available_views.index(default_view)
+                selected_view = st.selectbox(
+                    "Warehouse View",
+                    options=available_views,
+                    index=default_idx,
+                    help="Select the database view containing survey responses",
+                )
+
+                if selected_view:
+                    try:
+                        df_fabric_preview = load_view(selected_view, limit=5)
+                        fabric_cols = [str(c) for c in df_fabric_preview.columns]
+                    except Exception as exc:
+                        st.error(f"Could not load view: {exc}")
+                        fabric_cols = []
+                        df_fabric_preview = None
+
+                    if fabric_cols:
+                        # ── Pre-analysis filters ──
+                        st.markdown("---")
+                        st.markdown("**🔍 Filter data before analysis**")
+
+                        # Detect date-like columns
+                        _date_hints = {"date", "time", "opened", "closed", "created", "completion"}
+                        date_cols = [c for c in fabric_cols if any(h in c.lower() for h in _date_hints)]
+                        # Detect categorical filter columns
+                        _cat_hints = {
+                            "product": "RSA Product Set",
+                            "version": "RSA Version/Condition",
+                            "region": "Account Global Region",
+                            "severity": "Severity",
+                        }
+                        cat_cols_found: dict[str, str] = {}
+                        for hint, expected in _cat_hints.items():
+                            if expected in fabric_cols:
+                                cat_cols_found[hint] = expected
+                            else:
+                                match = next((c for c in fabric_cols if hint in c.lower()), None)
+                                if match:
+                                    cat_cols_found[hint] = match
+
+                        fabric_filters: dict = {}
+
+                        # Date range filter
+                        if date_cols:
+                            date_col = st.selectbox(
+                                "Date column",
+                                options=date_cols,
+                                index=0,
+                                key="fab_date_col",
+                            )
+                            col_start, col_end = st.columns(2)
+                            from datetime import date as _date, timedelta
+                            with col_start:
+                                start_date = st.date_input(
+                                    "From",
+                                    value=_date.today() - timedelta(days=365),
+                                    key="fab_start_date",
+                                )
+                            with col_end:
+                                end_date = st.date_input(
+                                    "To",
+                                    value=_date.today(),
+                                    key="fab_end_date",
+                                )
+                            if start_date and end_date:
+                                fabric_filters[date_col] = (str(start_date), str(end_date))
+
+                        # Categorical filters (product, version, region, etc.)
+                        for hint, col_name in cat_cols_found.items():
+                            cache_key = f"_fab_distinct_{col_name}"
+                            if cache_key not in st.session_state:
+                                try:
+                                    st.session_state[cache_key] = load_distinct_values(selected_view, col_name)
+                                except Exception:
+                                    st.session_state[cache_key] = []
+                            distinct_vals = st.session_state[cache_key]
+                            if distinct_vals:
+                                chosen = st.multiselect(
+                                    col_name,
+                                    options=distinct_vals,
+                                    default=[],
+                                    key=f"fab_filter_{col_name}",
+                                )
+                                if chosen:
+                                    fabric_filters[col_name] = chosen
+
+                        # Show filtered preview
+                        if fabric_filters:
+                            try:
+                                df_fabric_preview = load_view(selected_view, limit=5, filters=fabric_filters)
+                                fabric_cols = [str(c) for c in df_fabric_preview.columns]
+                                n_filtered = count_rows(selected_view, filters=fabric_filters)
+                                st.info(f"**{n_filtered:,}** rows match the current filters")
+                            except Exception as exc:
+                                st.warning(f"Filter preview error: {exc}")
+
+                        st.markdown("---")
+
+                        # Auto-map known Fabric columns — no manual mapping needed
+                        fabric_mapping: dict[str, str | None] = {}
+                        for field_key in _REQUIRED_FIELD_KEYS:
+                            suggestion = _suggest_mapping(fabric_cols, field_key)
+                            fabric_mapping[field_key] = suggestion
+                        optional_key = _OPTIONAL_FIELD_KEYS[0]
+                        fabric_mapping[optional_key] = _suggest_mapping(fabric_cols, optional_key)
+
+                        # If auto-mapping fails for any required field, fall back to manual selectors
+                        auto_mapped = all(fabric_mapping.get(k) for k in _REQUIRED_FIELD_KEYS)
+                        if not auto_mapped:
+                            st.markdown("**Map warehouse columns to required survey fields**")
+                            for field_key in _REQUIRED_FIELD_KEYS:
+                                options = ["— Select column —", *fabric_cols]
+                                default_fld = options.index(fabric_mapping[field_key]) if fabric_mapping.get(field_key) and fabric_mapping[field_key] in options else 0
+                                selected = st.selectbox(
+                                    f"{field_key} *",
+                                    options=options,
+                                    index=default_fld,
+                                    key=f"fab_map_{field_key}",
+                                )
+                                fabric_mapping[field_key] = None if selected == options[0] else selected
+
+                            fab_opt_options = ["— Not provided —", *fabric_cols]
+                            fab_opt_idx = fab_opt_options.index(fabric_mapping[optional_key]) if fabric_mapping.get(optional_key) and fabric_mapping[optional_key] in fab_opt_options else 0
+                            fab_opt_selected = st.selectbox(
+                                f"{optional_key} (optional)",
+                                options=fab_opt_options,
+                                index=fab_opt_idx,
+                                key=f"fab_map_{optional_key}",
+                            )
+                            fabric_mapping[optional_key] = None if fab_opt_selected == fab_opt_options[0] else fab_opt_selected
+
+                        if df_fabric_preview is not None and all(fabric_mapping.get(k) for k in _REQUIRED_FIELD_KEYS):
+                            preview_c = [fabric_mapping[k] for k in _REQUIRED_FIELD_KEYS if fabric_mapping[k]]
+                            if fabric_mapping.get(optional_key):
+                                preview_c.append(fabric_mapping[optional_key])
+                            st.caption("Preview (first 5 rows)")
+                            st.dataframe(df_fabric_preview[preview_c].head(5), use_container_width=True)
+
+                        if st.button("Analyse Warehouse Data", type="primary", use_container_width=True):
+                            missing_req = [k for k in _REQUIRED_FIELD_KEYS if not fabric_mapping.get(k)]
+                            if missing_req:
+                                st.error(f"Missing required mappings: {', '.join(missing_req)}")
+                                st.stop()
+
+                            req_vals = [fabric_mapping[k] for k in _REQUIRED_FIELD_KEYS]
+                            if len(set(req_vals)) != len(req_vals):
+                                st.error("Each required field must map to a different column.")
+                                st.stop()
+
+                            with st.spinner("Loading full dataset from Fabric Warehouse..."):
+                                df_fabric_full = load_view(selected_view, filters=fabric_filters if fabric_filters else None)
+
+                            structured_rows = _build_structured_rows(df_fabric_full, fabric_mapping)  # type: ignore[arg-type]
+                            if not structured_rows:
+                                st.warning("No eligible rows found in the warehouse view.")
+                                st.stop()
+
+                            print(f"\n📤 FABRIC: Storing {len(structured_rows)} rows from {selected_view}")
+                            st.session_state["_pending_structured_rows"] = structured_rows
+                            from language_tools import set_pending_structured_rows
+                            set_pending_structured_rows(structured_rows)
+
+                            prompt_text = load_prompt_text()
+                            filter_summary = ""
+                            if fabric_filters:
+                                parts = []
+                                for fc, fv in fabric_filters.items():
+                                    if isinstance(fv, tuple):
+                                        parts.append(f"{fc}: {fv[0]} → {fv[1]}")
+                                    elif isinstance(fv, list):
+                                        parts.append(f"{fc}: {', '.join(fv)}")
+                                    else:
+                                        parts.append(f"{fc}: {fv}")
+                                filter_summary = " · Filters: " + " | ".join(parts)
+                            header = (
+                                f"Source: **Fabric Warehouse** · View: **{selected_view}**{filter_summary}\n"
+                                f"Eligible structured rows: **{len(structured_rows)}**"
+                            )
+                            user_msg = (
+                                f"{header}\n\n"
+                                f"{prompt_text}\n\n"
+                                "Call analyze_structured_survey with NO arguments so it uses the full uploaded dataset."
+                            )
+
+                            st.session_state.messages.append({"role": "user", "content": user_msg})
+                            st.session_state["_pending_file_msg"] = user_msg
+                            st.session_state["_last_filename"] = selected_view.replace(".", "_")
+                            st.rerun()
 
         st.divider()
         if st.button("🗑️ New Conversation", use_container_width=True):
             reset_thread(client)
             st.rerun()
+
+        # PDF download — shown whenever a completed analysis exists
+        if st.session_state.get("_last_structured_survey_full_payload") and st.session_state.get("_last_agent_reply"):
+            st.divider()
+            _offer_pdf_download(
+                st.session_state.get("_last_filename", "survey"),
+                st.session_state["_last_agent_reply"],
+                label="📄 Download PDF Report",
+            )
 
         st.divider()
         st.caption(f"Thread: `{st.session_state.get('thread_id', '...')}`")
@@ -812,7 +1182,10 @@ def main() -> None:
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            if msg["role"] == "assistant":
+                _render_agent_reply(msg["content"])
+            else:
+                st.markdown(msg["content"])
 
     if not st.session_state.messages:
         with st.chat_message("assistant"):
@@ -820,7 +1193,7 @@ def main() -> None:
                 st.markdown(
                     "👋 Hi! I'm your Survey Analysis Agent. You can:\n\n"
                     "- **Upload an Excel file** and map required survey fields\n"
-                    "- **Query Fabric data** using natural language\n"
+                    "- **Connect to Fabric Warehouse** and analyse live data\n"
                     "- **Type a message** below — paste responses directly or ask questions"
                 )
             else:
@@ -835,7 +1208,11 @@ def main() -> None:
         with st.chat_message("assistant"):
             with st.status("Starting Foundry Agent...", expanded=True) as status:
                 reply = send_message(client, config["agent_id"], st.session_state.thread_id, user_msg, status_widget=status, task="file")
-            st.markdown(reply)
+            _render_agent_reply(reply)
+            # Store the pure agent reply (no prompt) for PDF export
+            st.session_state["_last_agent_reply"] = reply
+            # Pre-build and cache the PDF now so the sidebar button is instant
+            _build_pdf_cached(st.session_state.get("_last_filename", "survey"), reply)
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
@@ -844,7 +1221,7 @@ def main() -> None:
         with st.chat_message("assistant"):
             with st.status("Starting Foundry Agent...", expanded=True) as status:
                 reply = send_message(client, config["agent_id"], st.session_state.thread_id, user_msg, status_widget=status, task="fabric")
-            st.markdown(reply)
+            _render_agent_reply(reply)
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
@@ -856,7 +1233,7 @@ def main() -> None:
         with st.chat_message("assistant"):
             with st.status("Starting Foundry Agent...", expanded=True) as status:
                 reply = send_message(client, config["agent_id"], st.session_state.thread_id, prompt, status_widget=status, task="chat")
-            st.markdown(reply)
+            _render_agent_reply(reply)
 
         st.session_state.messages.append({"role": "assistant", "content": reply})
 

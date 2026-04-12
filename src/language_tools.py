@@ -24,6 +24,9 @@ _pending_documents: list[str] | None = None
 # Pending structured survey rows (new flow)
 _pending_structured_rows: list[dict[str, Any]] | None = None
 
+# All enriched rows from the most recent analysis (for follow-up queries)
+_last_enriched_rows: list[dict[str, Any]] | None = None
+
 
 def set_pending_documents(documents: list[str]) -> None:
     """Store uploaded text documents for the next legacy tool call."""
@@ -711,10 +714,15 @@ def _build_evidence_summary(eligible_rows: list[dict[str, Any]]) -> dict[str, An
 
     # Group by cluster and sentiment
     by_cluster_sentiment: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    # Also group by cluster only (all sentiments) — used for named-item scanning so that
+    # neutral follow-up responses ("KB was fine", "portal was okay") still contribute
+    # portal/tool/feature mention counts even though they don't drive sentiment.
+    by_cluster_all: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in evidence_rows:
         cluster = row.get("main_cluster", "Unmapped")
         sentiment = row.get("response_sentiment", "Neutral")
         by_cluster_sentiment[(cluster, sentiment)].append(row)
+        by_cluster_all[cluster].append(row)
         # Dual-tagged: Positive/Neutral overall but has negative sub-points
         # Route into negative evidence for ALL clusters the negative content relates to
         if row.get("has_negative_mentions") and sentiment != "Negative":
@@ -758,9 +766,11 @@ def _build_evidence_summary(eligible_rows: list[dict[str, Any]]) -> dict[str, An
                     if first_phrase and len(first_phrase) > 3:
                         free_text_phrases_count[first_phrase] += 1
 
-        # Extract named items (tools, portals, features, product areas)
+        # Extract named items (tools, portals, features, product areas).
+        # Scans ALL free-text rows for this cluster (including neutral) so that
+        # follow-up responses like "the KB was okay" still register as KB mentions.
         named_items_count = Counter()
-        for row in rows_in_group:
+        for row in by_cluster_all.get(cluster, rows_in_group):
             text = row.get("response_value", "").strip().lower()
             seen_labels = set()
             for keyword, label in _NAMED_ITEMS.items():
@@ -778,20 +788,30 @@ def _build_evidence_summary(eligible_rows: list[dict[str, Any]]) -> dict[str, An
                 else:
                     sample_verbatims.append(response[:400] + "...")
 
+        # Items with <=1 mention are kept in the counters for completeness calculations
+        # but filtered out of the output sent to the agent (noise reduction).
         top_structured = [
             {"label": label, "mentions": count}
             for label, count in structured_values_count.most_common(10)
+            if count > 1
         ]
 
         top_free_text = [
             {"label": label, "mentions": count}
             for label, count in free_text_phrases_count.most_common(10)
+            if count > 1
         ]
 
         top_named_items = [
             {"item": item, "mentions": count}
             for item, count in named_items_count.most_common(10)
+            if count > 1
         ]
+
+        # Count how many mentions are covered by named themes vs uncategorized
+        # Uses full counters (not filtered) so the math stays accurate
+        themed_mentions = sum(c for _, c in free_text_phrases_count.items()) + sum(c for _, c in structured_values_count.items())
+        uncategorized_mentions = max(0, len(rows_in_group) - themed_mentions)
 
         target_dict = result["negative_by_cluster"] if sentiment == "Negative" else result["positive_by_cluster"]
         target_dict[cluster] = {
@@ -800,6 +820,7 @@ def _build_evidence_summary(eligible_rows: list[dict[str, Any]]) -> dict[str, An
             "named_items": top_named_items,
             "sample_verbatims": sample_verbatims,
             "total_evidence_rows": len(rows_in_group),
+            "uncategorized_freetext_mentions": uncategorized_mentions,
         }
 
     return result
@@ -1129,7 +1150,7 @@ def analyze_structured_survey(
         all_texts = [r["response_value"] for r in eligible_rows]
         phrase_results: list[list[str]] = [[] for _ in all_texts]
         cursor = 0
-        for chunk in _chunked(all_texts, 10):
+        for chunk in _chunked(all_texts, 5):
             results = client.extract_key_phrases(chunk)
             for doc in results:
                 if not doc.is_error:
@@ -1142,7 +1163,7 @@ def analyze_structured_survey(
         all_texts = [r["response_value"] for r in eligible_rows]
         entity_results: list[list[dict[str, Any]]] = [[] for _ in all_texts]
         cursor = 0
-        for chunk in _chunked(all_texts, 10):
+        for chunk in _chunked(all_texts, 5):
             results = client.recognize_entities(chunk)
             for doc in results:
                 if not doc.is_error:
@@ -1242,15 +1263,19 @@ def analyze_structured_survey(
 
     main_cluster_breakdown.sort(key=lambda x: (-x["total_mentions"], x["main_cluster"]))
 
-    # Ensure key phrases are available for free-text evidence extraction
+    # Ensure key phrases are available for free-text evidence extraction.
+    # Only extract for negative/positive rows — neutral rows don't contribute to
+    # evidence and skipping them significantly reduces API call volume.
     free_text_rows_without_phrases = [
         (idx, r) for idx, r in enumerate(eligible_rows)
-        if r.get("response_type") == "free_text" and not r.get("key_phrases")
+        if r.get("response_type") == "free_text"
+        and not r.get("key_phrases")
+        and r.get("response_sentiment") in ("Negative", "Positive")
     ]
     if free_text_rows_without_phrases:
         texts_to_extract = [r["response_value"] for _, r in free_text_rows_without_phrases]
         cursor = 0
-        for chunk in _chunked(texts_to_extract, 10):
+        for chunk in _chunked(texts_to_extract, 5):
             results = client.extract_key_phrases(chunk)
             for doc in results:
                 _, row = free_text_rows_without_phrases[cursor]
@@ -1288,6 +1313,11 @@ def analyze_structured_survey(
         f"Options: {coverage['structured_option_rows']}, "
         f"NonSentiment: {coverage['non_sentiment_rows']}"
     )
+
+    # Store all enriched rows for follow-up chat queries
+    global _last_enriched_rows
+    _last_enriched_rows = [dict(r) for r in eligible_rows]
+    print(f"💾 Stored {len(_last_enriched_rows)} enriched rows for follow-up queries")
 
     payload = {
         "coverage": coverage,
@@ -1345,13 +1375,16 @@ def extract_key_phrases(documents: Any) -> str:
     """Extract the key phrases from each document."""
     client = _get_client()
     docs = _docs(documents)
-    results = client.extract_key_phrases(docs)
     output = []
-    for i, doc in enumerate(results):
-        if doc.is_error:
-            output.append({"index": i, "error": doc.error.message})
-        else:
-            output.append({"index": i, "text": docs[i], "key_phrases": list(doc.key_phrases)})
+    cursor = 0
+    for chunk in _chunked(docs, 5):
+        results = client.extract_key_phrases(chunk)
+        for i, doc in enumerate(results):
+            if doc.is_error:
+                output.append({"index": cursor + i, "error": doc.error.message})
+            else:
+                output.append({"index": cursor + i, "text": docs[cursor + i], "key_phrases": list(doc.key_phrases)})
+        cursor += len(chunk)
     return json.dumps(output, ensure_ascii=False)
 
 
@@ -1359,27 +1392,30 @@ def recognize_entities(documents: Any) -> str:
     """Recognise named entities (people, places, organisations, dates, …)."""
     client = _get_client()
     docs = _docs(documents)
-    results = client.recognize_entities(docs)
     output = []
-    for i, doc in enumerate(results):
-        if doc.is_error:
-            output.append({"index": i, "error": doc.error.message})
-        else:
-            output.append(
-                {
-                    "index": i,
-                    "text": docs[i],
-                    "entities": [
-                        {
-                            "text": e.text,
-                            "category": e.category,
-                            "subcategory": e.subcategory,
-                            "confidence": round(e.confidence_score, 3),
-                        }
-                        for e in doc.entities
-                    ],
-                }
-            )
+    cursor = 0
+    for chunk in _chunked(docs, 5):
+        results = client.recognize_entities(chunk)
+        for i, doc in enumerate(results):
+            if doc.is_error:
+                output.append({"index": cursor + i, "error": doc.error.message})
+            else:
+                output.append(
+                    {
+                        "index": cursor + i,
+                        "text": docs[cursor + i],
+                        "entities": [
+                            {
+                                "text": e.text,
+                                "category": e.category,
+                                "subcategory": e.subcategory,
+                                "confidence": round(e.confidence_score, 3),
+                            }
+                            for e in doc.entities
+                        ],
+                    }
+                )
+        cursor += len(chunk)
     return json.dumps(output, ensure_ascii=False)
 
 
@@ -1433,10 +1469,97 @@ def recognize_pii_entities(documents: Any) -> str:
     return json.dumps(output, ensure_ascii=False)
 
 
+# ─── Follow-up query tool ────────────────────────────────────────────────────
+
+def query_survey_data(
+    sentiment: str | None = None,
+    cluster: str | None = None,
+    keyword: str | None = None,
+    keywords: list[str] | None = None,
+    question: str | None = None,
+    survey_id: str | None = None,
+    response_type: str | None = None,
+    limit: int = 50,
+) -> str:
+    """
+    Query the enriched survey rows from the most recent analysis.
+    All filters are optional and combined with AND logic.
+    'keywords' (list) uses OR logic — a row matches if ANY keyword is found.
+    Returns matching rows with all enrichment fields.
+    """
+    global _last_enriched_rows
+
+    # Also try Streamlit session state as fallback
+    rows = _last_enriched_rows
+    if not rows:
+        try:
+            import streamlit as st
+            rows = st.session_state.get("_all_enriched_rows")
+            if not rows:
+                payload = st.session_state.get("_last_structured_survey_full_payload")
+                if isinstance(payload, dict):
+                    rows = payload.get("enriched_rows", []) or payload.get("enriched_rows_sample", [])
+        except Exception:
+            pass
+
+    if not rows:
+        return json.dumps({"error": "No analysis data available. Please run an analysis first."})
+
+    # Build keyword list — combine single keyword + keywords list
+    all_keywords: list[str] = []
+    if keyword:
+        all_keywords.append(keyword.lower())
+    if keywords:
+        all_keywords.extend(k.lower() for k in keywords if k)
+
+    # Apply filters
+    results = []
+    cluster_lower = cluster.lower() if cluster else None
+    question_lower = question.lower() if question else None
+    survey_id_str = str(survey_id).strip() if survey_id else None
+
+    for row in rows:
+        if sentiment and row.get("response_sentiment", "").lower() != sentiment.lower():
+            continue
+        if cluster_lower and cluster_lower not in row.get("main_cluster", "").lower():
+            continue
+        if question_lower and question_lower not in row.get("question_name", "").lower():
+            continue
+        if survey_id_str and str(row.get("survey_response_id", "")).strip() != survey_id_str:
+            continue
+        if response_type and row.get("response_type", "").lower() != response_type.lower():
+            continue
+        if all_keywords:
+            text = row.get("response_value", "").lower()
+            phrases = " ".join(row.get("key_phrases", [])).lower()
+            searchable = text + " " + phrases
+            if not any(kw in searchable for kw in all_keywords):
+                continue
+        results.append(row)
+
+    # Limit output size
+    capped = min(limit, 100)
+    output = {
+        "total_matches": len(results),
+        "returned": min(len(results), capped),
+        "rows": results[:capped],
+    }
+
+    # Add summary stats for the filtered set
+    if results:
+        sentiments = Counter(r.get("response_sentiment", "Unknown") for r in results)
+        clusters = Counter(r.get("main_cluster", "Unknown") for r in results)
+        output["sentiment_breakdown"] = dict(sentiments)
+        output["cluster_breakdown"] = dict(clusters)
+
+    return json.dumps(output, ensure_ascii=False)
+
+
 # ─── Dispatch table ───────────────────────────────────────────────────────────
 
 TOOL_DISPATCH: dict[str, Any] = {
     "analyze_structured_survey": analyze_structured_survey,
+    "query_survey_data": query_survey_data,
     "analyze_sentiment": analyze_sentiment,
     "extract_key_phrases": extract_key_phrases,
     "recognize_entities": recognize_entities,
@@ -1468,6 +1591,64 @@ TOOL_DEFINITIONS = [
                         "type": "boolean",
                         "description": "Include entity extraction for each row.",
                         "default": False,
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_survey_data",
+            "description": (
+                "Query the enriched survey data from the most recent analysis. "
+                "Use this to answer follow-up questions about specific verbatims, "
+                "customers, clusters, or sentiment categories. "
+                "All filter parameters are optional and combined with AND logic. "
+                "Use 'keywords' (list) for OR-based text search across multiple terms. "
+                "Returns matching rows with survey_response_id, question_name, "
+                "response_value, response_sentiment, main_cluster, key_phrases, "
+                "response_type, and any additional mapped fields."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sentiment": {
+                        "type": "string",
+                        "description": "Filter by sentiment: Positive, Negative, or Neutral.",
+                        "enum": ["Positive", "Negative", "Neutral"],
+                    },
+                    "cluster": {
+                        "type": "string",
+                        "description": "Filter by main cluster name (partial match, case-insensitive). E.g. 'Technical Support' or 'Resolution'.",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "Search for a single keyword in response text and key phrases (case-insensitive).",
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Search for ANY of these keywords (OR logic) in response text and key phrases. Use this for broad searches, e.g. ['app', 'mobile', 'software', 'bug', 'crash', 'not working'].",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "Filter by question name (partial match, case-insensitive).",
+                    },
+                    "survey_id": {
+                        "type": "string",
+                        "description": "Filter by exact survey response ID.",
+                    },
+                    "response_type": {
+                        "type": "string",
+                        "description": "Filter by response type: free_text, structured_rating, structured_option_signal, or structured_operational.",
+                        "enum": ["free_text", "structured_rating", "structured_option_signal", "structured_operational"],
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of rows to return (default 50, max 100).",
+                        "default": 50,
                     },
                 },
                 "required": [],

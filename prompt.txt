@@ -271,6 +271,20 @@ Table:
 - Mentions
 - % of Negative Total
 
+CRITICAL: Driver table must be COMPLETE. For each cluster:
+- Check evidence_summary → negative_by_cluster[cluster]["total_evidence_rows"] for the true total
+- Driver row Mentions must sum to total_evidence_rows for that cluster
+- Use evidence_summary → negative_by_cluster[cluster]["uncategorized_freetext_mentions"] for the count of responses that didn't form a recurring phrase theme
+- Do NOT collapse these into one generic catch-all row. Instead, read sample_verbatims and extract 2–4 SPECIFIC, ACTIONABLE sub-themes:
+  - Each sub-theme must name a concrete issue (e.g. "Response times on critical tickets", "Engineer knowledge gaps on niche products", "Escalation path unclear")
+  - Assign realistic mention estimates per sub-theme based on how many verbatims reflect it
+  - Only use a small residual "Miscellaneous individual feedback" row for verbatims with truly no shared pattern
+- Sub-theme names and descriptions must be specific and actionable — NEVER write "Varied concerns", "General feedback", or "Individual responses"
+- Example: TSQ 28 negatives, themed drivers = 5, remaining 23 must become real sub-themes:
+  "Resolution Speed | Time-to-resolution exceeded expectations | 9" + "Escalation Clarity | Unclear when/why escalated | 7" + "Knowledge Depth | Engineer unfamiliar with product area | 5" + "Miscellaneous | Isolated one-offs | 2"
+- NEVER show 1 mention when the cluster breakdown shows 28 negative responses exist
+- NEVER produce a single "Varied individual concerns" row that hides the actual feedback
+
 Then include short context paragraphs by relevant main cluster. Each paragraph MUST:
 - lead with the SPECIFIC issue (not the category name)
 - cite exact mention counts from evidence_summary → named_items
@@ -289,6 +303,13 @@ Table:
 - Primary Sub-theme
 - Mentions
 - % of Positive Total
+
+CRITICAL: Same completeness rule applies as for negative drivers.
+- Check evidence_summary → positive_by_cluster[cluster]["total_evidence_rows"] for the true positive count
+- Do NOT collapse uncategorized positive responses into a single generic row
+- Read sample_verbatims and identify 2–4 specific, actionable sub-themes (e.g. "Engineer fully resolved in one session", "Proactive updates during long-running issue", "Documentation matched current product version")
+- Only use a small residual "Miscellaneous positive feedback" row for genuinely isolated one-offs
+- Sub-theme names must be specific and behavior/outcome-oriented — NEVER write "Good service", "Positive experience", or "Varied positive feedback"
 
 Then include short context paragraphs by relevant main cluster. Each paragraph MUST:
 - lead with the SPECIFIC strength (not the category name)
