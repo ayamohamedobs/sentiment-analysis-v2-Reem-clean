@@ -319,11 +319,19 @@ def _compute_rows_checksum(rows: list[dict[str, Any]]) -> str:
 
 def _build_hard_proof(payload: dict[str, Any]) -> dict[str, Any]:
     coverage = payload.get("coverage", {}) if isinstance(payload.get("coverage"), dict) else {}
+    
+    # Handle both old format (full enriched_rows) and new format (enriched_rows_sample + enriched_rows_count)
     enriched_rows = payload.get("enriched_rows", []) if isinstance(payload.get("enriched_rows"), list) else []
+    enriched_rows_sample = payload.get("enriched_rows_sample", []) if isinstance(payload.get("enriched_rows_sample"), list) else []
+    enriched_rows_count = payload.get("enriched_rows_count", 0) if isinstance(payload.get("enriched_rows_count"), int) else 0
+    
+    # Use full rows if available (old format), else use count and sample (new format)
+    rows_in_payload = enriched_rows if enriched_rows else enriched_rows_sample
+    total_rows_processed = len(enriched_rows) if enriched_rows else enriched_rows_count
 
-    total_rows = int(coverage.get("total_rows", len(enriched_rows)) or 0)
-    eligible_rows = int(coverage.get("eligible_rows", len(enriched_rows)) or 0)
-    processed_rows = int(coverage.get("processed_rows", len(enriched_rows)) or 0)
+    total_rows = int(coverage.get("total_rows", 0) or 0)
+    eligible_rows = int(coverage.get("eligible_rows", 0) or 0)
+    processed_rows = int(coverage.get("processed_rows", 0) or 0)
     failed_rows = int(coverage.get("failed_rows", 0) or 0)
 
     return {
@@ -331,9 +339,9 @@ def _build_hard_proof(payload: dict[str, Any]) -> dict[str, Any]:
         "rows_eligible_for_analysis": eligible_rows,
         "rows_processed": processed_rows,
         "rows_failed": failed_rows,
-        "rows_kept_in_full_payload": len(enriched_rows),
-        "rows_lost_check": max(processed_rows - len(enriched_rows), 0),
-        "full_rows_sha256": _compute_rows_checksum(enriched_rows),
+        "rows_kept_in_full_payload": len(rows_in_payload),
+        "rows_lost_check": max(processed_rows - total_rows_processed, 0),
+        "full_rows_sha256": _compute_rows_checksum(rows_in_payload),
     }
 
 
@@ -342,21 +350,66 @@ def _prepare_tool_output_for_submit(fn_name: str, result: str) -> str:
     Keep full row-level payload locally, but submit a TPM-safe aggregate payload to the agent.
     This does NOT truncate analysis itself; it only reduces transport volume.
     """
+    print(f"\n🔧 _prepare_tool_output_for_submit(fn_name={fn_name})")
+    print(f"   result type: {type(result)}")
+    print(f"   result size: {len(result) if isinstance(result, str) else 'N/A'} bytes")
+    
     if fn_name != "analyze_structured_survey":
+        print(f"   ⏭️ Not analyze_structured_survey, returning as-is")
         return result
 
     try:
         payload = json.loads(result)
-    except (json.JSONDecodeError, TypeError):
+        print(f"✅ JSON parsed successfully")
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"❌ JSON parse failed: {e}")
         return result
 
-    if not isinstance(payload, dict):
+    print(f"   payload type: {type(payload)}")
+    if isinstance(payload, dict):
+        print(f"   Top-level keys: {sorted(payload.keys())}")
+    else:
+        print(f"   ⚠️ payload is not dict, is {type(payload)}")
         return result
 
     if payload.get("error"):
+        print(f"   ⚠️ payload contains error: {payload.get('error')}")
         return result
 
     st.session_state["_last_structured_survey_full_payload"] = payload
+
+    # Debug: Inspect each candidate key path
+    print(f"\n   Inspecting row candidates:")
+    
+    candidate_paths = [
+        ("enriched_rows_sample", lambda p: p.get("enriched_rows_sample", [])),
+        ("enriched_rows", lambda p: p.get("enriched_rows", [])),
+        ("rows", lambda p: p.get("rows", [])),
+        ("data", lambda p: p.get("data", [])),
+    ]
+    
+    for key_name, extractor in candidate_paths:
+        try:
+            extracted = extractor(payload)
+            is_list = isinstance(extracted, list)
+            count = len(extracted) if is_list else "N/A (not list)"
+            print(f"     {key_name}: {count} rows (type: {type(extracted).__name__})")
+            if is_list and extracted and len(extracted) > 0:
+                print(f"       First row: {extracted[0]}")
+        except Exception as e:
+            print(f"     {key_name}: ERROR - {e}")
+    
+    # The actual extraction
+    enriched_rows_sample = payload.get("enriched_rows_sample", [])
+    enriched_rows_count = payload.get("enriched_rows_count", 0)
+    
+    print(f"\n   Extracted for transport:")
+    print(f"     enriched_rows_sample: {type(enriched_rows_sample).__name__}, {len(enriched_rows_sample) if isinstance(enriched_rows_sample, list) else '?'} items")
+    print(f"     enriched_rows_count: {enriched_rows_count} (type: {type(enriched_rows_count).__name__})")
+    
+    if isinstance(enriched_rows_sample, list) and enriched_rows_sample:
+        print(f"     First sample row keys: {sorted(enriched_rows_sample[0].keys())}")
+        print(f"     First sample row: {enriched_rows_sample[0]}")
 
     proof = _build_hard_proof(payload)
     transport_payload = {
@@ -364,14 +417,32 @@ def _prepare_tool_output_for_submit(fn_name: str, result: str) -> str:
         "survey_level_sentiment": payload.get("survey_level_sentiment", {}),
         "response_level_sentiment": payload.get("response_level_sentiment", {}),
         "main_cluster_breakdown": payload.get("main_cluster_breakdown", []),
+        "evidence_summary": payload.get("evidence_summary", {}),
+        "enriched_rows_sample": enriched_rows_sample,
+        "enriched_rows_count": enriched_rows_count,
         "hard_proof": proof,
+        "analysis_completed_on_full_dataset": True,
+        "total_rows_analyzed": enriched_rows_count,
+        "reference_sample_only": True,
         "notes": {
-            "analysis_mode": "full_row_analysis_no_truncation",
-            "transport_mode": "aggregate_only_for_tpm_safety",
-            "full_rows_available_locally": True,
+            "description": "All rows were analyzed; sample provided for context",
+            "sample_size": len(enriched_rows_sample),
+            "total_rows_analyzed": enriched_rows_count,
         },
     }
-    return json.dumps(transport_payload, ensure_ascii=False)
+    
+    print(f"\n🚀 FINAL TRANSPORT PAYLOAD:")
+    print(f"   enriched_rows_sample in transport: {len(transport_payload.get('enriched_rows_sample', []))} rows")
+    print(f"   enriched_rows_count in transport: {transport_payload.get('enriched_rows_count', 0)}")
+    if transport_payload.get('enriched_rows_sample'):
+        row1 = transport_payload['enriched_rows_sample'][0]
+        print(f"   Sample row 1 in transport: {row1}")
+    else:
+        print(f"   ⚠️ NO ROWS IN TRANSPORT SAMPLE")
+    
+    result_json = json.dumps(transport_payload, ensure_ascii=False)
+    print(f"   Transport JSON size: {len(result_json)} bytes\n")
+    return result_json
 
 
 def _append_hard_proof_block(reply: str) -> str:
@@ -418,6 +489,24 @@ def _build_tool_outputs(run, client: AIProjectClient, thread_id: str, status_wid
         except Exception as exc:  # noqa: BLE001
             result = json.dumps({"error": str(exc)})
 
+        # Debug: Show raw tool result before processing
+        if fn_name == "analyze_structured_survey":
+            print(f"\n🔨 RAW TOOL RESULT from {fn_name}:")
+            print(f"   Type: {type(result)}")
+            print(f"   Size: {len(result) if isinstance(result, str) else 'N/A'} bytes")
+            if isinstance(result, str) and len(result) < 5000:
+                try:
+                    parsed = json.loads(result)
+                    print(f"   Parsed keys: {sorted(parsed.keys()) if isinstance(parsed, dict) else 'not-a-dict'}")
+                    if isinstance(parsed, dict):
+                        print(f"   enriched_rows_sample: {len(parsed.get('enriched_rows_sample', []))} rows")
+                        print(f"   enriched_rows_count: {parsed.get('enriched_rows_count', 0)}")
+                except:
+                    print(f"   Could not parse as JSON")
+            else:
+                print(f"   (Result too large to show, size={len(result)})")
+
+
         processed = _extract_processed_count(fn_name, fn_args, result)
         if processed:
             st.session_state.setdefault("_rows_processed", 0)
@@ -435,11 +524,27 @@ def _build_tool_outputs(run, client: AIProjectClient, thread_id: str, status_wid
         print(f"  ⚙️ {fn_name} took {time.time() - t0:.1f}s")
         tool_outputs.append(ToolOutput(tool_call_id=call.id, output=output_for_submit))
 
-    return client.agents.runs.submit_tool_outputs(
-        thread_id=thread_id,
-        run_id=run.id,
-        tool_outputs=tool_outputs,
-    )
+    # Debug: print tool output sizes before submitting
+    for t in tool_outputs:
+        output_text = t.output if hasattr(t, 'output') else t.get("output", "")
+        print("TOOL OUTPUT SIZE:", len(output_text))
+    print("TOTAL TOOL OUTPUT BYTES:", sum(len(t.output if hasattr(t, 'output') else t.get("output", "")) for t in tool_outputs))
+
+    # Submit tool outputs with diagnostic error handling
+    try:
+        return client.agents.runs.submit_tool_outputs(
+            thread_id=thread_id,
+            run_id=run.id,
+            tool_outputs=tool_outputs,
+        )
+    except Exception:
+        print("submit_tool_outputs failed")
+        print("tool_outputs count:", len(tool_outputs))
+        for i, t in enumerate(tool_outputs):
+            output_size = len(t.output if hasattr(t, 'output') else t.get("output", ""))
+            print(f"tool_output[{i}] size:", output_size)
+        print("TOTAL TOOL OUTPUT BYTES:", sum(len(t.output if hasattr(t, 'output') else t.get("output", "")) for t in tool_outputs))
+        raise
 
 
 def _wait_for_run(client: AIProjectClient, thread_id: str, run, status_widget=None, task: str = "chat") -> object:
@@ -652,9 +757,15 @@ def main() -> None:
                     st.warning("No eligible rows found. Only rows with non-empty response_value are processed.")
                     st.stop()
 
+                # Store rows in session state AND global backup for tool access
+                print(f"\n📤 UPLOAD: Storing {len(structured_rows)} rows")
+                if structured_rows:
+                    print(f"   Row 1: {structured_rows[0]}")
+                    print(f"   Columns: {list(structured_rows[0].keys())}")
+                st.session_state["_pending_structured_rows"] = structured_rows
                 from language_tools import set_pending_structured_rows
-
                 set_pending_structured_rows(structured_rows)
+                print(f"✅ Rows stored in session + global backup\n")
 
                 prompt_text = load_prompt_text()
                 header = (

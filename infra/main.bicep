@@ -15,7 +15,7 @@ param environmentName string
 param location string
 
 @description('GPT model to deploy as the agent backbone')
-param gptModelName string = 'gpt-4o'
+param gptModelName string = 'gpt-5.4-mini'
 
 @description('GPT model version')
 param gptModelVersion string = '2024-11-20'

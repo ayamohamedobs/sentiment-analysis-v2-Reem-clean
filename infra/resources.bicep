@@ -15,7 +15,7 @@ param baseName string
 param location string = resourceGroup().location
 
 @description('GPT model to deploy as the agent backbone')
-param gptModelName string = 'gpt-4o'
+param gptModelName string = 'gpt-5.4-mini'
 
 @description('GPT model version')
 param gptModelVersion string = '2024-11-20'
@@ -164,7 +164,7 @@ resource foundryProject 'Microsoft.CognitiveServices/accounts/projects@2025-06-0
 
 resource gptDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025-06-01' = {
   parent: aiServices
-  name: 'gpt-4o'
+  name: 'gpt-5.4-mini'
   sku: {
     name: 'GlobalStandard'
     capacity: gptCapacity

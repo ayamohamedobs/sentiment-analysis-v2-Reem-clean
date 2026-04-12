@@ -33,7 +33,7 @@ from azure.identity import DefaultAzureCredential
 
 AI_SERVICES_ENDPOINT = os.environ["AZURE_AI_SERVICES_ENDPOINT"]
 FOUNDRY_PROJECT = os.environ.get("FOUNDRY_PROJECT_NAME", "sentiment-analysis")
-GPT_DEPLOYMENT = os.environ.get("GPT_DEPLOYMENT_NAME", "gpt-4o")
+GPT_DEPLOYMENT = os.environ.get("GPT_DEPLOYMENT_NAME", "gpt-5.4-mini")
 TOOL_MODE = os.environ.get("LANGUAGE_TOOL_MODE", "sdk").lower()
 
 LANGUAGE_MCP_URL = (

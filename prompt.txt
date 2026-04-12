@@ -1,87 +1,309 @@
 Analyze the uploaded survey XLSX file.
 
-The dataset contains messy and non-sequential survey data.
+The dataset may be messy, non-sequential, and contain multiple response types within the same survey.
 
-Use these fields together:
+Always interpret each row using these three fields together:
 - Survey response ID
 - Question: name
 - Response value
 
 Do NOT analyze Response value in isolation.
 
-Requirements:
-- process ALL rows
-- reconstruct relationships between responses
-- use Survey response ID to group related answers
-- use Question: name to determine context and main cluster
-- normalize sentiment to Positive / Neutral / Negative
-- assign ONE main cluster per response
-- extract one Primary Sub-theme and optionally one Secondary Sub-theme from free-text only
-- use ratings for sentiment only
+Core rules:
+- process ALL eligible rows
+- reconstruct survey context using Survey response ID
 - link follow-up responses even if they are not sequential
-- build key drivers from grouped sub-themes grounded in verbatim
+- use Question: name as the primary basis for main cluster assignment
+- normalize sentiment to exactly:
+  - Positive
+  - Neutral
+  - Negative
+- assign exactly ONE main cluster per response
+- allow Unmapped when a response cannot be mapped confidently
+- do not invent, merge, rename, or shorten main cluster labels
+- do not force unclear rows into Overall Service Delivery
+- do not overuse Neutral
+- do not guess from isolated rows
 
-Critical rule:
-- Primary Sub-theme and Secondary Sub-theme must come from verbatim
-- key drivers must come from grouped verbatim-derived sub-themes
-- summaries must synthesize what customers are actually saying
-- recommendations must be grounded in verbatim-derived drivers
+Response type rules:
+Classify each response as one of:
+- rating
+- structured select-option evidence
+- free-text / verbatim
+- operational / factual
 
-Use only the approved Main Cluster labels exactly as defined.
-Do not merge or rename cluster labels.
+Definitions:
+- rating = satisfaction or agreement scale response
+- structured select-option evidence = selected dissatisfaction, issue, or improvement option
+- free-text / verbatim = open-ended customer comment
+- operational / factual = yes / no / don't know or contextual status answer
 
-Use stable canonical labels for positive and negative drivers.
-Normalize similar driver labels into one consistent label before generating the final tables.
+Use of response types:
+- ratings mainly drive sentiment classification
+- structured select-option evidence and free-text / verbatim are valid customer-stated evidence
+- operational / factual responses may be kept for context but must NOT drive themes, key drivers, summaries, or recommendations
+- operational / factual responses must NOT be included in sentiment breakdowns, main cluster percentages, or theme/sub-theme tables
 
-For the overview section:
-- include total number of surveys analyzed
-- include survey-level sentiment breakdown with BOTH counts and percentages
-- include total number of responses analyzed
-- include response-level sentiment breakdown with BOTH counts and percentages
+Sentiment normalization:
+Use this exact mapping when applicable.
 
-For the key driver sections:
-- after the negative-driver table, include concise context summaries by relevant main cluster
-- after the positive-driver table, include concise context summaries by relevant main cluster
-- in those summaries, mention specific tools, portals, products, workflows, processes, or product features when they are clearly referenced in customer comments
-- keep the summaries concise and actionable
-- do not use vague wording when a specific callout is available from the verbatim
+POSITIVE:
+- Totally Satisfied
+- Very Satisfied
+- Somewhat Satisfied
+- Strongly Agree
+- Agree
 
-At the end of the output:
-- include a validation table showing all analyzed responses and their assigned tags
+NEUTRAL:
+- Neither Satisfied nor Dissatisfied
+- Neither Agree Nor Disagree
 
-The validation table must include:
-- Survey response ID
-- Question: name
-- Response value
-- Main Cluster
-- Primary Sub-theme
-- Secondary Sub-theme
-- Response Sentiment
-- Survey-Level Sentiment
+NEGATIVE:
+- Somewhat Dissatisfied
+- Disagree
+- Very Dissatisfied
+- Totally Dissatisfied
+- Strongly Disagree
 
+If a response value is misspelled, inconsistently formatted, or slightly varied, infer the closest valid sentiment using context.
+
+Short negative phrase rule:
+Clearly negative short phrases must not drift into Neutral just because they are brief.
+
+Examples:
+- couldn't find documentation
+- hard to navigate
+- login issue
+- unable to download
+
+When a short phrase clearly describes friction, failure, difficulty, or inability, treat it as Negative evidence.
+
+Approved Main Cluster labels:
+- Product Satisfaction
+- Tools
+- Overall Service Delivery
+- Technical Support Quality
+- Communication
+- Documentation & Knowledge base
+- Unmapped
+
+Main cluster assignment priority:
+1. exact or near-exact match to the fixed approved question-to-main-cluster mapping
+2. explicit documentation / knowledge base rule
+3. supported fallback reasoning using survey context
+4. otherwise Unmapped
+
+Response text must never override a clear question-based mapping.
+
+Fixed question-to-main-cluster mapping:
+
+Product Satisfaction
+- Overall, how satisfied are you with the RSA product this service case was opened for?
+- Please tell us specifically why you provided the above answer regarding the RSA Product.
+
+Tools
+- How satisfied are you overall with RSA's online support tools?
+- Additional comments for RSA online support tools?
+- Please provide additional detail to help us better understand the issue:
+- What one improvement area would you suggest for RSA’s online support tools?
+
+Overall Service Delivery
+- Thinking only of the service case referenced in the email, how satisfied are you with the service you received?
+- Please tell us specifically why you provided the above answer regarding the service you received.
+- To what extent do you agree with the following statement: RSA made it easy for me to resolve my technical issue?
+
+Technical Support Quality
+- How would you rate your overall satisfaction with the Technical Support Engineer(s)?
+- What was the primary source of your dissatisfaction?
+- Which of the following elements contributed to your lower level of satisfaction with time to resolve?
+- Other, please specify
+- "Did the Technical Support Engineer(s) you worked with have to include other RSA teams to help resolve the issue?" belongs to this cluster, but responses such as yes / no / don't know are operational / factual and should be excluded from sentiment and theme generation.
+
+Communication
+- How satisfied are you with the time it took to resolve your service case?
+- Overall, how satisfied are you with receiving timely communication regarding case status?
+
+Documentation & Knowledge base
+- assign this cluster when the question or follow-up is specifically about help articles, documentation, user guides, knowledge base content, self-service guidance, troubleshooting articles, or the quality, completeness, usability, clarity, or findability of documented support content
+
+If a response belongs to one of the mapped questions above, assign the corresponding main cluster.
+Only use fallback reasoning if the question is not already mapped.
+
+Context and linkage rules:
+- use Survey response ID to group related answers from the same survey
+- determine whether a row is a parent question, follow-up question, standalone response, or linked response
+- follow-up rows may appear far away from their parent rows
+- use question meaning and survey context to reconstruct relationships
+- do not force a parent/follow-up linkage if the relationship is unclear
+
+Evidence rules:
+Customer-stated evidence includes:
+- meaningful free-text / verbatim responses
+- valid structured dissatisfaction, issue, or improvement selections
+
+Evidence priority:
+1. linked free-text / verbatim
+2. linked structured select-option evidence
+3. standalone structured select-option evidence when no stronger linked free-text exists
+
+When a structured option is linked to verbatim:
+- use the structured option as the broad category
+- use the linked verbatim to extract the specific portal, site, product area, workflow, feature, documentation type, or system context
+- prefer the more specific label when the verbatim clearly supports it
+
+Examples:
+- "Site Navigation" + verbatim mentioning the community portal → "Community Portal Navigation"
+- "Product Documentation" + verbatim mentioning license portal documentation → "License Portal Documentation Gaps"
+- "Authentication / Login" + verbatim mentioning the support case portal → "Support Case Portal Login Issues"
+
+Do NOT use these as standalone driver evidence:
+- ratings
+- yes / no answers
+- don't know answers
+- factual operational answers
+
+Theme rules:
+For each meaningful evidence row, assign:
+- one Primary Theme
+- one Primary Sub-theme
+- optionally one Secondary Sub-theme
+
+Definitions:
+- Primary Theme = broader recurring issue or strength
+- Primary Sub-theme = more specific and actionable expression of the Primary Theme
+- Secondary Sub-theme = optional second distinct issue or strength
+
+Theme rules:
+- prefer linked free-text / verbatim when available
+- if structured option evidence has linked verbatim, use the verbatim to make the sub-theme more specific
+- if no stronger linked free-text exists, structured select-option evidence alone may support theme assignment
+- do not invent themes when the evidence is too vague
+- do not use vague labels like:
+  - issue
+  - problem
+  - feedback
+  - dissatisfaction
+  - support issue
+  - product issue
+- use specific, actionable labels grounded in what the customer actually said or selected
+
+Normalization rules:
+- normalize similar themes and sub-themes into stable canonical labels
+- group similar wording into one consistent driver label when appropriate
+- preserve meaningful specificity when the evidence clearly identifies different portals, systems, product areas, or workflows
+- avoid duplicate or near-duplicate driver labels in the same dataset
+
+Key driver rules:
+- build key drivers from grouped customer-stated evidence
+- key drivers should come from recurring Primary Themes and Primary Sub-themes
+- include all main clusters that have real evidence, not only the top two or three
+- use customer-stated evidence to drive:
+  - primary themes
+  - sub-themes
+  - key drivers
+  - mention counts
+  - coverage across clusters
+  - insight paragraphs
+- do not build key drivers from sentiment percentages alone
+- do not build key drivers from ratings alone
+- do not write summaries that simply restate tables
+
+Summary rules:
 When summarizing:
-- do NOT restate tables
-- do NOT rely on percentages alone
 - explain what customers are actually saying
+- describe where the friction or strength is happening
+- call out specific tools, portals, product areas, workflows, features, integrations, documentation types, or named systems when clearly referenced
+- include approximate mention counts when they materially strengthen the insight
+- keep summaries concise, specific, and actionable
+- do NOT rely on percentages alone
+- do NOT restate tables
+- do NOT invent insight not supported by customer evidence
 
-Provide output in this structure:
-1. Customer Sentiment Overview
-2. Where Sentiment Breaks Down
-3. Key Drivers of Negative Sentiment
-   - include the table
-   - then include a context summary with short paragraphs by relevant main cluster
-4. Key Drivers of Positive Sentiment
-   - include the table
-   - then include a context summary with short paragraphs by relevant main cluster
-5. Insight-Driven Recommendations
+Recommendations:
+- always provide at least 5 recommendations
+- each recommendation must be directly tied to recurring customer evidence
+- recommendations must be specific, actionable, and business-relevant
+- do not generate generic recommendations
 
-Include coverage summary:
+Overview requirements:
+Include:
+- total number of surveys analyzed
+- survey-level sentiment breakdown with both counts and percentages
+- total number of responses analyzed
+- response-level sentiment breakdown with both counts and percentages
+
+Coverage Summary requirements:
+Include:
 - total rows
 - eligible rows
 - rating rows
+- structured select-option evidence rows
 - free-text rows
+- operational / factual rows
 - processed rows
 - failed rows
 - coverage %
 
-Keep output concise, structured, and executive-ready.
+Provide output in this structure:
+
+1. Customer Sentiment Overview
+- include total number of surveys analyzed
+- include survey-level sentiment breakdown with both counts and percentages
+- include total number of responses analyzed
+- include response-level sentiment breakdown with both counts and percentages
+- then provide a short executive summary
+
+2. Where Sentiment Breaks Down
+Table:
+- Main Cluster
+- Positive %
+- Neutral %
+- Negative %
+- Total Mentions
+
+Then add a short insight paragraph.
+
+3. Key Drivers of Negative Sentiment
+Table:
+- Main Cluster
+- Primary Theme
+- Primary Sub-theme
+- Mentions
+- % of Negative Total
+
+Then include short context paragraphs by relevant main cluster. Each paragraph MUST:
+- lead with the SPECIFIC issue (not the category name)
+- cite exact mention counts from evidence_summary → named_items
+- quote or closely paraphrase at least one customer verbatim from sample_verbatims
+- state what customers want fixed or improved (derive from the verbatims)
+- NEVER write vague summaries like "upgrade experience and product/workflow limitations" — name the exact issues
+- if named_items shows {"item": "Licensing", "mentions": 4}, you MUST name "Licensing" explicitly with its count
+
+BAD (too vague): "Negative product feedback centered on upgrade experience and product/workflow limitations."
+GOOD (specific): "Licensing complexity was cited by 4 customers — one noted 'I wish licensing was easier.' Patching burden was raised 3 times with customers describing it as 'a huge amount of work.' On-prem vs cloud feature parity was flagged by 3 respondents."
+
+4. Key Drivers of Positive Sentiment
+Table:
+- Main Cluster
+- Primary Theme
+- Primary Sub-theme
+- Mentions
+- % of Positive Total
+
+Then include short context paragraphs by relevant main cluster. Each paragraph MUST:
+- lead with the SPECIFIC strength (not the category name)
+- cite exact mention counts from evidence_summary → named_items
+- quote or closely paraphrase at least one customer verbatim from sample_verbatims
+- state what customers valued and why it matters
+- NEVER write vague summaries — name the exact tools, features, or behaviors praised
+
+5. Insight-Driven Recommendations
+For each recommendation include:
+- Title
+- Why
+- Recommendation
+
+6. Coverage Summary
+
+Final quality bar:
+Keep the output concise, structured, executive-ready, grounded in actual customer evidence, and specific about tools, features, workflows, portals, and documentation when the evidence supports it.
