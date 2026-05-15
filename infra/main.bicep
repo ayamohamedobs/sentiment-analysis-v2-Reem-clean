@@ -53,7 +53,7 @@ var resourceGroupName = 'rg-${environmentName}'
 
 
 module resources 'resources.bicep' = {
-  scope: rg
+  scope: resourceGroup()
   name: 'sentiment-analysis-resources'
   params: {
     baseName: environmentName
