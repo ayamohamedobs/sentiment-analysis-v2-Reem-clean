@@ -1,5 +1,5 @@
 // azd entry point — creates the resource group and deploys all resources
-targetScope = 'subscription'
+targetScope = 'resourceGroup'
 
 @description('Name of the azd environment (used to derive resource group name)')
 @minLength(3)
