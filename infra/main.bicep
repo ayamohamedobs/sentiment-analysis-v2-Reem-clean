@@ -18,7 +18,7 @@ param location string
 param gptModelName string = 'gpt-4o'
 
 @description('GPT model version')
-param gptModelVersion string = '2024-05-13'
+param gptModelVersion string = ''
 
 @description('Capacity (TPM in thousands) for the GPT deployment')
 param gptCapacity int = 10
