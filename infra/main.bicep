@@ -49,9 +49,6 @@ var tags = {
   project: 'sentiment-analysis'
 }
 
-var resourceGroupName = 'rg-${environmentName}'
-
-
 module resources 'resources.bicep' = {
   scope: resourceGroup()
   name: 'sentiment-analysis-resources'
