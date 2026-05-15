@@ -51,11 +51,6 @@ var tags = {
 
 var resourceGroupName = 'rg-${environmentName}'
 
-resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
-  name: resourceGroupName
-  location: location
-  tags: tags
-}
 
 module resources 'resources.bicep' = {
   scope: rg
