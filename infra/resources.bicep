@@ -18,7 +18,7 @@ param location string = resourceGroup().location
 param gptModelName string = 'gpt-4o'
 
 @description('GPT model version')
-param gptModelVersion string = '2024-08-06'
+param gptModelVersion string = ''
 
 @description('Capacity (TPM in thousands) for the GPT deployment')
 param gptCapacity int = 50
