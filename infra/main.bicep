@@ -15,10 +15,10 @@ param environmentName string
 param location string
 
 @description('GPT model to deploy as the agent backbone')
-param gptModelName string = 'gpt-5.4-mini'
+param gptModelName string = 'gpt-4o'
 
 @description('GPT model version')
-param gptModelVersion string = '2024-11-20'
+param gptModelVersion string = '2024-05-13'
 
 @description('Capacity (TPM in thousands) for the GPT deployment')
 param gptCapacity int = 10
@@ -75,6 +75,6 @@ output AZURE_AI_SERVICES_ENDPOINT string = resources.outputs.aiServicesEndpoint
 output AZURE_LANGUAGE_ENDPOINT string = resources.outputs.languageEndpoint
 output AZURE_FOUNDRY_PROJECT_ENDPOINT string = resources.outputs.foundryProjectEndpoint
 output AZURE_GPT_DEPLOYMENT_NAME string = resources.outputs.gptDeploymentName
-output AZURE_RESOURCE_GROUP string = rg.name
+output AZURE_RESOURCE_GROUP string = resourceGroup().name
 output APPLICATIONINSIGHTS_CONNECTION_STRING string = resources.outputs.appInsightsConnectionString
 output FABRIC_CONNECTION_NAME string = resources.outputs.fabricConnectionName
