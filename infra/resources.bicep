@@ -61,10 +61,6 @@ var projectName = 'sentiment-analysis'
 
 // ─── Well-known role definition IDs ─────────────────────────────────────────
 
-var roles = {
-  cognitiveServicesUser: 'a97b65f3-24c7-4388-baec-2e87135dc908'
-}
-
 // ─── Log Analytics Workspace (for Application Insights) ────────────────────
 
 resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
