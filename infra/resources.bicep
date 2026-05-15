@@ -282,35 +282,6 @@ resource fabricConnection 'Microsoft.CognitiveServices/accounts/projects/connect
   }
 }
 
-// ─── Role assignments ──────────────────────────────────────────────────────
-
-// AI Services identity → Cognitive Services User on Language service
-resource aiServicesLanguageRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(languageService.id, aiServices.id, roles.cognitiveServicesUser)
-  scope: languageService
-  properties: {
-    principalId: aiServices.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roles.cognitiveServicesUser
-    )
-  }
-}
-
-// Foundry Project identity → Cognitive Services User on Language service
-resource projectLanguageRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(languageService.id, foundryProject.id, roles.cognitiveServicesUser)
-  scope: languageService
-  properties: {
-    principalId: foundryProject.identity.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roles.cognitiveServicesUser
-    )
-  }
-}
 
 // ─── Outputs ────────────────────────────────────────────────────────────────
 
